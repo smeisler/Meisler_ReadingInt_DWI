@@ -22,7 +22,7 @@ bids=/path/to/bids/root/ # Make this match your path
 if [[ $# -eq 0 ]]; then
     # first go to data directory, grab all subjects,
     # and assign to an array
-    pushd $fs_dir
+    pushd $bids
     subjs=($(ls sub-* -d))
     popd
 fi
