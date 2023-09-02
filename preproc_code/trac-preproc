@@ -1,0 +1,2481 @@
+#! /bin/tcsh -f
+
+#
+# trac-preproc
+#
+# Tractography pre-processing for a single subject
+#
+# Original Author: Anastasia Yendiki
+#
+# Copyright © 2011 The General Hospital Corporation (Boston, MA) "MGH"
+#
+# Terms and conditions for use, reproduction, distribution and contribution
+# are found in the 'FreeSurfer Software License Agreement' contained
+# in the file 'LICENSE' found in the FreeSurfer distribution, and here:
+#
+# https://surfer.nmr.mgh.harvard.edu/fswiki/FreeSurferSoftwareLicense
+#
+# Reporting: freesurfer@nmr.mgh.harvard.edu
+#
+#
+
+umask 002
+
+set VERSION = 'trac-preproc @FS_VERSION@';
+set ProgName = `basename $0`
+set inputargs = ($argv)
+
+#------------ Set default options -----------------------------------------#
+
+set PrintHelp = 0	# Print help and exit
+
+set debug = 0		# Generate more output
+
+set DoTime = 0		# Time main commands
+set fs_time = ()
+
+set rcfile = ()		# Name of input run command file
+set LF = ()		# Name of log file
+set CF = ()		# Name of command file
+
+set DoIsRunning = 1	# Create a lock file while processing continues
+
+set RunIt = 1		# If 0, do everything but run commands (for debugging)
+
+#------------ Parse input arguments ---------------------------------------#
+
+if ($#argv == 0) goto usage_exit
+
+set n = `echo $argv | egrep -e -help | wc -l`
+if ($n != 0) then
+  set PrintHelp = 1
+  goto usage_exit
+endif
+
+set n = `echo $argv | egrep -e -version | wc -l`
+if ($n != 0) then
+  echo $VERSION
+  exit 0
+endif
+
+source $FREESURFER_HOME/sources.csh
+
+goto parse_args
+parse_args_return:
+goto check_params
+check_params_return:
+
+#------------ Read configuration file -------------------------------------#
+
+source $rcfile
+
+if ($intrareg == 1 || $intrareg == 2) then
+  set reg = flt
+else if ($intrareg == 3) then
+  set reg = bbr
+endif
+
+if ($interreg == 1 || $interreg == 2) then
+  set xspace = mni
+else if ($interreg == 3) then
+  set xspace = rob
+else if ($interreg == 4) then
+  set xspace = cvs
+  set cvstempdir = `dirname $intertrg`		# Assuming ../mri/norm.mgz
+  set cvstempdir = `dirname $cvstempdir`
+  set cvstemp    = `basename $cvstempdir`
+  set cvstempdir = `dirname $cvstempdir`
+  set cvswarp = final_CVSmorph_to$cvstemp
+else if ($interreg == 5) then
+  set xspace = syn
+  setenv MY_MORPHS_DO_NOT_CONFORM_DEAL_WITH_IT
+else if ($interreg == 6) then
+  set xspace = fnt
+endif
+
+if ($DoTime) then
+  fs_time ls >& /dev/null
+  if (! $status) set fs_time = fs_time
+endif
+
+printf '\n\n' >> $LF
+echo "New invocation of $ProgName"  >> $LF
+printf '\n\n' >> $LF
+whoami >> $LF
+hostname >> $LF
+uname -a >> $LF
+limit >> $LF
+if (-e /usr/bin/free) then
+  echo "" >> $LF
+  /usr/bin/free >> $LF
+  echo "" >> $LF
+endif
+if ("`uname -s`" == "Darwin") then
+  echo "" >> $LF
+  /usr/bin/top -l 1 | grep PhysMem >> $LF
+  echo "" >> $LF
+endif
+
+#---------- Is this a longitudinal base template? -----------------------#
+
+set dobase = 0
+
+if ($?tplist) then
+  if ($#tplist > 0) set dobase = 1
+endif
+
+#---------- Create output directories -----------------------------------#
+
+set dtdir = $dtroot/$subj
+set fsdir = $SUBJECTS_DIR/$subj
+set dwidir = $dtdir/dmri
+set xfmdir = $dwidir/xfms
+set labdir = $dtdir/dlabel
+set touchdir = $dtdir/touch
+
+mkdir -p $dwidir $xfmdir $labdir
+
+#---------- Handle run status files -------------------------------------#
+
+# Delete the error file. This is created when error_exit is run.
+set ErrorFile = $dtdir/scripts/trac-all.error
+rm -f $ErrorFile
+
+# Delete the done file. This is created when the program exits normally.
+set DoneFile = $dtdir/scripts/$ProgName.done
+rm -f $DoneFile
+
+if ($DoIsRunning) then
+  set IsRunningFile = $dtdir/scripts/IsRunning.trac
+
+  if (-e $IsRunningFile) then
+    echo ""
+    echo "ERROR: it appears that an analysis is already running"
+    echo "for $subj based on the presence of $IsRunningFile. It could"
+    echo "also be that an analysis was running at one point but"
+    echo "died in an unexpected way. If it is the case that there"
+    echo "is a process running, you can kill it and start over or"
+    echo "just let it run. If the process has died, you should type:"
+    echo ""
+    echo "rm $IsRunningFile"
+    echo ""
+    echo "and re-run. Or you can add -no-isrunning to the trac-all"
+    echo "command-line. The contents of this file are:"
+    echo "----------------------------------------------------------"
+    cat  $IsRunningFile
+    echo "----------------------------------------------------------"
+    exit 1
+  endif
+
+  echo "------------------------------"	>  $IsRunningFile 
+  echo "SUBJECT $subj"			>> $IsRunningFile 
+  echo "DATE `date`"			>> $IsRunningFile 
+  echo "USER `whoami`"			>> $IsRunningFile 
+  echo "HOST `hostname`"		>> $IsRunningFile 
+  echo "PROCESSID $$"			>> $IsRunningFile 
+  echo "PROCESSOR `uname -m`"		>> $IsRunningFile 
+  echo "OS `uname -s`"			>> $IsRunningFile 
+  uname -a				>> $IsRunningFile 
+  echo "PROGRAM $ProgName"		>> $IsRunningFile 
+  echo $VERSION				>> $IsRunningFile 
+else
+  set IsRunningFile = ()
+endif
+
+# Put a copy of myself (this script) in the scripts dir
+cp $0 $dtdir/scripts/$ProgName.local-copy
+
+if (! $RunIt) then
+  echo "INFO: -dontrun flag is in effect so subsequent commands" |& tee -a $LF
+  echo "may not have accurate arguments!" |& tee -a $LF
+endif
+
+echo "#-------------------------------------" |& tee -a $LF
+echo "$0 $argv" |& tee -a $LF |& tee -a $CF
+
+#------------ Image corrections -------------------------------------------#
+
+if ($docorr && ! $dobase) then
+  echo "#-------------------------------------" |& tee -a $LF
+  echo "#@# Image corrections `date`" |& tee -a $LF
+
+  mkdir -p $labdir/diff
+
+  # Convert DWIs from DICOM or other format
+  set nrun = $#dcmfile			# Number of input DWI runs
+
+  rm -f $dwidir/dcminfo.dat
+ 
+  @ irun = 1
+  while ($irun <= $nrun)		# For each input DWI run
+    set dwibase = $dwidir/dwi_orig.$irun
+
+    set infile = $dcmfile[$irun]
+    if ($#dcmroot > 0) set infile = $dcmroot/$infile
+
+    set cmd = (rm -f $dwibase.bvals $dwibase.bvecs)
+    echo $cmd |& tee -a $LF |& tee -a $CF
+    if ($RunIt) then
+      $cmd |& tee -a $LF
+      if ($status) goto error_exit
+    endif
+
+    set cmd = (mri_convert --bvec-voxel $infile $dwibase.nii.gz)
+    echo $cmd |& tee -a $LF |& tee -a $CF
+    if ($RunIt) then
+      $cmd |& tee -a $LF
+      if ($status) goto error_exit
+    endif
+
+    if (-e $dwibase.voxel_space.bvecs) then
+      set cmd = (mv -f $dwibase.voxel_space.bvecs $dwibase.bvecs)
+      echo $cmd |& tee -a $LF |& tee -a $CF
+      if ($RunIt) then
+        $cmd |& tee -a $LF
+        if ($status) goto error_exit
+      endif
+    endif
+
+    if (`mri_info --format $infile` =~ *dicom*) then
+      set cmd = (mri_probedicom --i $infile)
+      echo "$cmd >> $dwidir/dcminfo.dat" |& tee -a $LF |& tee -a $CF
+      if ($RunIt) then
+        ($cmd >> $dwidir/dcminfo.dat) >>& $LF
+        if ($status) goto error_exit
+      endif
+    endif
+
+    @ irun = $irun + 1
+  end					# For each input DWI run
+
+  # Get gradient and b-value tables (if provided by user)
+  @ irun = 1
+  while ($irun <= $nrun)		# For each input DWI run
+    set dwibase = $dwidir/dwi_orig.$irun
+
+    if ($#bvecfile) then
+      if ($#bvecfile == 1) then
+        set infile = $bvecfile
+      else
+        set infile = $bvecfile[$irun]
+      endif
+      if ($#dcmroot > 0) set infile = $dcmroot/$infile
+
+      if ($infile != $dwibase.bvecs) then
+        if ($RunIt) then
+          tr -d '\r' < $infile > $dwibase.bvecs
+          if ($status) goto error_exit
+        endif
+      endif
+    endif
+
+    if ($#bvalfile) then
+      if ($#bvalfile == 1) then
+        set infile = $bvalfile
+      else
+        set infile = $bvalfile[$irun]
+      endif
+      if ($#dcmroot > 0) set infile = $dcmroot/$infile
+
+      if ($infile != $dwibase.bvals) then
+        if ($RunIt) then
+          tr -d '\r' < $infile > $dwibase.bvals
+          if ($status) goto error_exit
+        endif
+      endif
+    endif
+
+    @ irun = $irun + 1
+  end					# For each input DWI run
+
+  # Assume that DWI DICOMs without gradient and b-value tables are b=0 only
+  set novecs = 1
+
+  @ irun = 1
+  while ($irun <= $nrun)		# For each input DWI run
+    set dwibase = $dwidir/dwi_orig.$irun
+
+    if (-e $dwibase.bvecs && -e $dwibase.bvals) then
+      set novecs = 0
+    else
+      if (! -e $dwibase.bvecs) \
+        echo "WARN: No gradient table found for $dwibase.nii.gz"
+
+      if (! -e $dwibase.bvals) \
+        echo "WARN: No b-value table found for $dwibase.nii.gz"
+
+      echo "WARN: Assuming that this is a b=0 scan only"
+
+      rm -f $dwibase.bvecs $dwibase.bvals
+
+      set nvol = `mri_info --nframes $dwibase.nii.gz`
+
+      @ ivol = 1
+      while ($ivol <= $nvol)
+        echo 0 0 0 >> $dwibase.bvecs
+        echo 0     >> $dwibase.bvals
+
+        @ ivol = $ivol + 1
+      end
+    endif
+
+    @ irun = $irun + 1
+  end					# For each input DWI run
+
+  if ($novecs) then
+    echo "ERROR: No gradient tables or b-value tables found" |& tee -a $LF
+    goto error_exit
+  endif
+
+  @ irun = 1
+  while ($irun <= $nrun)		# For each input DWI run
+    set dwibase    = $dwidir/dwi_orig.$irun
+    set dwibaseLAS = $dwidir/dwi_orig_las.$irun
+
+    # Check if there is the same number of b-values and gradient vectors
+    set nvec = `wc -w $dwibase.bvecs | awk '{print $1}'`
+    set nvec = `echo "$nvec/3" | bc -l`
+    set nvec = `printf '%g' $nvec`
+
+    set nval = `wc -w $dwibase.bvals | awk '{print $1}'`
+
+    if ($nval != $nvec) then
+      echo "ERROR: Found $nval b-values but $nvec gradient vectors for $dwibase" |& tee -a $LF
+      goto error_exit
+    endif
+
+    # Check if gradient vectors are arranged in 3 rows or 3 columns
+    if (`awk 'NR==1' $dwibase.bvecs | wc -w` == 3) then
+      set vectype = cols
+    else if (`awk '{print $1}' $dwibase.bvecs | wc -w` == 3) then
+      set vectype = rows
+    else
+      echo "ERROR: Gradient vectors must be 3 rows or 3 columns of coordinates" |& tee -a $LF
+      goto error_exit
+    endif
+
+    # Convert gradient vectors to 3-column format
+    if ($vectype == rows) then
+      set xx = `awk 'NR==1' $dwibase.bvecs`
+      set yy = `awk 'NR==2' $dwibase.bvecs`
+      set zz = `awk 'NR==3' $dwibase.bvecs`
+    else
+      set xx = `awk '{print $1}' $dwibase.bvecs`
+      set yy = `awk '{print $2}' $dwibase.bvecs`
+      set zz = `awk '{print $3}' $dwibase.bvecs`
+    endif
+
+    set blist = `cat $dwibase.bvals`
+
+    set cmd = (rm -f $dwibase.bvals.tmp $dwibase.bvecs.tmp)
+    echo $cmd |& tee -a $LF |& tee -a $CF
+    if ($RunIt) then
+      $cmd |& tee -a $LF
+      if ($status) goto error_exit
+    endif
+
+    @ k = 1
+    while ($k <= $#blist)
+      echo $blist[$k] >> $dwibase.bvals.tmp
+      echo $xx[$k] $yy[$k] $zz[$k] >> $dwibase.bvecs.tmp
+      @ k = $k + 1
+    end
+
+    set cmd = (mv -f $dwibase.bvecs.tmp $dwibase.bvecs)
+    echo $cmd |& tee -a $LF |& tee -a $CF
+    if ($RunIt) then
+      $cmd |& tee -a $LF
+      if ($status) goto error_exit
+    endif
+
+    set cmd = (mv -f $dwibase.bvals.tmp $dwibase.bvals)
+    echo $cmd |& tee -a $LF |& tee -a $CF
+    if ($RunIt) then
+      $cmd |& tee -a $LF
+      if ($status) goto error_exit
+    endif
+
+    # Change orientation to LAS
+    set cmd = (orientLAS $dwibase.nii.gz $dwibaseLAS.nii.gz)
+    echo $cmd |& tee -a $LF |& tee -a $CF
+    if ($RunIt) then
+      $cmd |& tee -a $LF
+      if ($status) goto error_exit
+    endif
+
+    @ irun = $irun + 1
+  end					# For each input DWI run
+
+  if ($doeddy > 1 || $dob0 > 1) then    # Set up acquisition parameter file
+    rm -f $dwidir/acqp.txt
+
+    @ irun = 1
+    while ($irun <= $nrun)		# For each input DWI run
+      if ($#pedir == 1) then
+        set pe = $pedir
+      else
+        set pe = $pedir[$irun]
+      endif
+
+      if ($#echospacing == 1) then
+        set esp = $echospacing
+      else
+        set esp = $echospacing[$irun]
+      endif
+      
+      if ($#epifactor == 1) then
+        set epif = $epifactor
+      else
+        set epif = $epifactor[$irun]
+      endif
+      
+      # Direction of increasing phase-encode lines (assuming LAS orientation)
+      if ($pe == RL) then
+        set pexyz = (1 0 0)
+      else if ($pe == LR) then
+        set pexyz = (-1 0 0)
+      else if ($pe == PA) then
+        set pexyz = (0 1 0)
+      else if ($pe == AP) then
+        set pexyz = (0 -1 0)
+      else if ($pe == IS) then
+        set pexyz = (0 0 1)
+      else if ($pe == SI) then
+        set pexyz = (0 0 -1)
+      endif
+
+      # Dwell time
+      set dwell = `echo "$esp * .001 * ($epif - 1)" | bc -l`
+
+      echo $pexyz $dwell >> $dwidir/acqp.txt
+
+      @ irun = $irun + 1
+    end					# For each input DWI run
+  endif
+
+  if ($dob0 > 1) then			# B0 inhomogeneities: with topup
+    if ( `printf '%s\n' $pedir       | sort --unique | wc -w` < 2 && \
+         `printf '%s\n' $echospacing | sort --unique | wc -w` < 2 ) then
+      echo "ERROR: All input scans have the same PE direction and echo-spacing" |& tee -a $LF
+      echo "ERROR: Cannot correct B0 distortions with topup" |& tee -a $LF
+      goto error_exit
+    endif
+
+    # Extract first b=0 volume from each run
+    set flist = ()
+
+    @ irun = 1
+    while ($irun <= $nrun)		# For each input DWI run
+      set dwibase = $dwidir/dwi_orig_las.$irun
+      set lowbase = $dwidir/lowb_orig_las.$irun
+
+      set bmin = `grep -v ^$ $dwibase.bvals | sort --numeric-sort | head -n 1`
+      set lowblist = `cat $dwibase.bvals \
+                      | awk -v bmin=$bmin '{if ($1 == bmin) print NR-1}'`
+
+      set cmd = mri_convert
+      set cmd = ($cmd --frame $lowblist[1])
+      set cmd = ($cmd $dwibase.nii.gz)
+      set cmd = ($cmd $lowbase.nii.gz)
+      echo $cmd |& tee -a $LF |& tee -a $CF
+      if ($RunIt) then
+        $fs_time $cmd |& tee -a $LF
+        if ($status) goto error_exit
+      endif
+
+      set flist = ($flist $lowbase.nii.gz)
+
+      @ irun = $irun + 1
+    end					# For each input DWI run
+
+    # Concatenate first b=0 volume from all runs
+    set cmd = mri_concat
+    set cmd = ($cmd --i $flist)
+    set cmd = ($cmd --o $dwidir/lowb_orig_las.nii.gz)
+    echo $cmd |& tee -a $LF |& tee -a $CF
+    if ($RunIt) then
+      $fs_time $cmd |& tee -a $LF
+      if ($status) goto error_exit
+    endif
+
+    # If image has an odd dimension, must turn off topup subsampling :/
+    set dims = `mri_info --dim $dwidir/lowb_orig_las.nii.gz`
+    foreach k (1 2 3)
+      set isodd = `echo $dims[$k] | awk '{print $1 % 2 == 1}'`
+      if ($isodd) break
+    end
+
+    set cnf = $FSLDIR/src/topup/flirtsch/b02b0.cnf
+
+    if ($isodd) then
+      echo "sed '/--subsamp/ s/2/1/g' $cnf > $dwidir/b02b0.cnf" \
+           |& tee -a $LF |& tee -a $CF
+      if ($RunIt) then
+        (sed '/--subsamp/ s/2/1/g' $cnf > $dwidir/b02b0.cnf) >>& $LF
+        if ($status) goto error_exit
+      endif
+    else
+      set cmd = (cp -p $FSLDIR/src/topup/flirtsch/b02b0.cnf $dwidir)
+      echo $cmd |& tee -a $LF |& tee -a $CF
+      if ($RunIt) then
+        $fs_time $cmd |& tee -a $LF
+        if ($status) goto error_exit
+      endif
+    endif
+
+    # Estimate off-resonance field
+    set cmd = topup
+    set cmd = ($cmd --imain=$dwidir/lowb_orig_las.nii.gz)
+    set cmd = ($cmd --datain=$dwidir/acqp.txt)
+    set cmd = ($cmd --config=$dwidir/b02b0.cnf)
+    set cmd = ($cmd --out=$dwidir/topup)
+    set cmd = ($cmd --iout=$dwidir/lowb_topup.nii.gz)
+    echo $cmd |& tee -a $LF |& tee -a $CF
+    if ($RunIt) then
+      $fs_time $cmd |& tee -a $LF
+      if ($status) goto error_exit
+    endif
+
+    if (! $doeddy) then			# Apply correction now
+      @ irun = 1
+      while ($irun <= $nrun)		# For each input DWI run
+        set dwibase = $dwidir/dwi_orig_las.$irun
+        set dwibasetop = $dwidir/dwi.$irun
+
+        set cmd = applytopup
+        set cmd = ($cmd --imain=$dwibase.nii.gz)
+        set cmd = ($cmd --inindex=$irun)
+        set cmd = ($cmd --datain=$dwidir/acqp.txt)
+        set cmd = ($cmd --topup=$dwidir/topup)
+        set cmd = ($cmd --method=jac)
+        set cmd = ($cmd --out=$dwibasetop.nii.gz)
+        echo $cmd |& tee -a $LF |& tee -a $CF
+        if ($RunIt) then
+          $cmd |& tee -a $LF
+          if ($status) goto error_exit
+        endif
+
+        # Copy gradient table
+        set cmd = (cp -p $dwibase.bvecs $dwibasetop.bvecs)
+        echo $cmd |& tee -a $LF |& tee -a $CF
+        if ($RunIt) then
+          $cmd |& tee -a $LF
+          if ($status) goto error_exit
+        endif
+
+        # Copy b-value table
+        set cmd = (cp -p $dwibase.bvals $dwibasetop.bvals)
+        echo $cmd |& tee -a $LF |& tee -a $CF
+        if ($RunIt) then
+          $cmd |& tee -a $LF
+          if ($status) goto error_exit
+        endif
+
+        @ irun = $irun + 1
+      end				# For each input DWI run
+
+      set dwibase = $dwidir/dwi
+    else				# Will apply correction later
+      set dwibase = $dwidir/dwi_orig_las
+    endif
+  else					# No topup, only combine runs
+    set dwibase = $dwidir/dwi_orig_las
+  endif
+
+  # Combine all DWI runs
+  if ($nrun == 1) then			# Have one run only
+    set cmd = (mv -f $dwibase.1.nii.gz $dwibase.nii.gz)
+    echo $cmd |& tee -a $LF |& tee -a $CF
+    if ($RunIt) then
+      $fs_time $cmd |& tee -a $LF
+      if ($status) goto error_exit
+    endif
+
+    set cmd = (mv -f $dwibase.1.bvecs $dwibase.bvecs)
+    echo $cmd |& tee -a $LF |& tee -a $CF
+    if ($RunIt) then
+      $fs_time $cmd |& tee -a $LF
+      if ($status) goto error_exit
+    endif
+
+    set cmd = (mv -f $dwibase.1.bvals $dwibase.bvals)
+    echo $cmd |& tee -a $LF |& tee -a $CF
+    if ($RunIt) then
+      $fs_time $cmd |& tee -a $LF
+      if ($status) goto error_exit
+    endif
+  else					# Have multiple runs
+    set flist_dwi = ()
+    set flist_vec = ()
+    set flist_val = ()
+
+    @ irun = 1
+    while ($irun <= $nrun)		# For each input DWI run
+      set flist_dwi = ($flist_dwi $dwibase.$irun.nii.gz)
+      set flist_vec = ($flist_vec $dwibase.$irun.bvecs)
+      set flist_val = ($flist_val $dwibase.$irun.bvals)
+
+      @ irun = $irun + 1
+    end					# For each input DWI run
+
+    set cmd = mri_concat
+    set cmd = ($cmd --i $flist_dwi)
+    set cmd = ($cmd --o $dwibase.nii.gz)
+    echo $cmd |& tee -a $LF |& tee -a $CF
+    if ($RunIt) then
+      $fs_time $cmd |& tee -a $LF
+      if ($status) goto error_exit
+    endif
+
+    set cmd = (cat $flist_vec)
+    echo "$cmd > $dwibase.bvecs" |& tee -a $LF |& tee -a $CF
+    if ($RunIt) then
+      ($cmd > $dwibase.bvecs) >>& $LF
+      if ($status) goto error_exit
+    endif
+
+    set cmd = (cat $flist_val)
+    echo "$cmd > $dwibase.bvals" |& tee -a $LF |& tee -a $CF
+    if ($RunIt) then
+      ($cmd > $dwibase.bvals) >>& $LF
+      if ($status) goto error_exit
+    endif
+  endif
+
+  if ($doeddy > 1) then			# Eddy currents: with eddy
+    set dwibase = $dwidir/dwi_orig_las
+
+    # Create a temporary brain mask
+    if ($dob0 > 1) then			# Have b=0 images unwarped by topup
+      set lowbase = $dwidir/lowb_topup
+
+      set cmd = mri_concat
+      set cmd = ($cmd --i $lowbase.nii.gz)
+      set cmd = ($cmd --mean)
+      set cmd = ($cmd --o $lowbase.nii.gz)
+      echo $cmd |& tee -a $LF |& tee -a $CF
+      if ($RunIt) then
+        $cmd |& tee -a $LF
+        if ($status) goto error_exit
+      endif
+    else				# Use first b=0 image
+      set lowbase = $dwidir/lowb_orig_las
+
+      set bmin = `grep -v ^$ $dwibase.bvals | sort --numeric-sort | head -n 1`
+      set lowblist = `cat $dwibase.bvals \
+                      | awk -v bmin=$bmin '{if ($1 == bmin) print NR-1}'`
+
+      set cmd = mri_convert
+      set cmd = ($cmd --frame $lowblist[1])
+      set cmd = ($cmd $dwibase.nii.gz)
+      set cmd = ($cmd $lowbase.nii.gz)
+      echo $cmd |& tee -a $LF |& tee -a $CF
+      if ($RunIt) then
+        $fs_time $cmd |& tee -a $LF
+        if ($status) goto error_exit
+      endif
+    endif
+
+    set cmd = bet
+    set cmd = ($cmd $lowbase.nii.gz)
+    set cmd = ($cmd ${lowbase}_brain.nii.gz)
+    set cmd = ($cmd -m -f $thrbet)
+    echo $cmd |& tee -a $LF |& tee -a $CF
+    if ($RunIt) then
+      $cmd |& tee -a $LF
+      if ($status) goto error_exit
+    endif
+
+    # Create volume index file
+    if ($nrun == 1) then		# Have one run only
+      set indlist = `awk '{printf "1 "}' $dwibase.bvals`
+    else
+      set indlist = ()
+
+      @ irun = 1
+      while ($irun <= $nrun)		# For each input DWI run
+        set indlist = ($indlist \
+          `awk -v irun=$irun '{printf irun" "}' $dwibase.$irun.bvals`)
+
+        @ irun = $irun + 1
+      end				# For each input DWI run
+    endif
+
+    echo $indlist > $dwidir/index.txt
+
+    # Correction
+    set cmd = eddy_openmp
+    set cmd = ($cmd --imain=$dwidir/dwi_orig_las.nii.gz)
+    set cmd = ($cmd --mask=${lowbase}_brain_mask.nii.gz)
+    set cmd = ($cmd --bvecs=$dwidir/dwi_orig_las.bvecs)
+    set cmd = ($cmd --bvals=$dwidir/dwi_orig_las.bvals)
+    set cmd = ($cmd --acqp=$dwidir/acqp.txt)
+    set cmd = ($cmd --index=$dwidir/index.txt)
+    set cmd = ($cmd --data_is_shelled)	# Assuming that it is!
+    if ($dob0 > 1) then			# Use previously run topup output
+      set cmd = ($cmd --topup=$dwidir/topup)
+    endif
+    if ($doeddy > 2) then		# Perform outlier replacement
+      set cmd = ($cmd --repol)
+    endif
+    set cmd = ($cmd --out=$dwidir/dwi)
+    echo $cmd |& tee -a $LF |& tee -a $CF
+    if ($RunIt) then
+      $cmd |& tee -a $LF
+      if ($status) goto error_exit
+    endif
+  else if ($doeddy == 1) then		# Eddy currents: with eddy_correct
+    rm -f $dwidir/dwi.ecclog
+
+    set cmd = eddy_correct
+    set cmd = ($cmd $dwidir/dwi_orig_las.nii.gz $dwidir/dwi.nii.gz 0)
+    echo $cmd |& tee -a $LF |& tee -a $CF
+    if ($RunIt) then
+      $fs_time $cmd |& tee -a $LF
+      if ($status) goto error_exit
+    endif
+
+    if ($dob0 > 1) then			# Apply unwarping from topup
+      set cmd = (mv -f $dwidir/dwi.nii.gz $dwidir/dwi_eddy.nii.gz)
+      echo $cmd |& tee -a $LF |& tee -a $CF
+      if ($RunIt) then
+        $cmd |& tee -a $LF
+        if ($status) goto error_exit
+      endif
+
+      set fstart = 0
+      set flist = ()
+
+      @ irun = 1
+      while ($irun <= $nrun)		# For each input DWI run
+        set nframe = `wc -w $dwidir/dwi_orig.$irun.bvals | awk '{print $1}'`
+        set fend = `echo "$fstart + $nframe" | bc`
+
+        set cmd = mri_convert
+        set cmd = ($cmd --fsubsample $fstart 1 $fend)
+        set cmd = ($cmd $dwidir/dwi_eddy.nii.gz)
+        set cmd = ($cmd $dwidir/dwi.$irun.nii.gz)
+        echo $cmd |& tee -a $LF |& tee -a $CF
+        if ($RunIt) then
+          $cmd |& tee -a $LF
+          if ($status) goto error_exit
+        endif
+
+        set cmd = applytopup
+        set cmd = ($cmd --imain=$dwidir/dwi.$irun.nii.gz)
+        set cmd = ($cmd --inindex=$irun)
+        set cmd = ($cmd --datain=$dwidir/acqp.txt)
+        set cmd = ($cmd --topup=$dwidir/topup)
+        set cmd = ($cmd --method=jac)
+        set cmd = ($cmd --out=$dwidir/dwi.$irun.nii.gz)
+        echo $cmd |& tee -a $LF |& tee -a $CF
+        if ($RunIt) then
+          $cmd |& tee -a $LF
+          if ($status) goto error_exit
+        endif
+
+        set fstart = $fend
+        set flist = ($flist $dwidir/dwi.$irun.nii.gz)
+
+        @ irun = $irun + 1
+      end				# For each input DWI run
+
+      # Concatenate them back together
+      set cmd = mri_concat
+      set cmd = ($cmd --i $flist)
+      set cmd = ($cmd --o $dwidir/dwi.nii.gz)
+      echo $cmd |& tee -a $LF |& tee -a $CF
+      if ($RunIt) then
+        $fs_time $cmd |& tee -a $LF
+        if ($status) goto error_exit
+      endif
+    endif
+  else if (! $doeddy && $dob0 < 2) then		# No eddy-current corrections
+    set cmd = (mv -f $dwidir/dwi_orig_las.nii.gz $dwidir/dwi.nii.gz)
+    echo $cmd |& tee -a $LF |& tee -a $CF
+    if ($RunIt) then
+      $cmd |& tee -a $LF
+      if ($status) goto error_exit
+    endif
+
+    set cmd = (mv -f $dwidir/dwi_orig_las.bvecs $dwidir/dwi.bvecs)
+    echo $cmd |& tee -a $LF |& tee -a $CF
+    if ($RunIt) then
+      $cmd |& tee -a $LF
+      if ($status) goto error_exit
+    endif
+
+    set cmd = (mv -f $dwidir/dwi_orig_las.bvals $dwidir/dwi.bvals)
+    echo $cmd |& tee -a $LF |& tee -a $CF
+    if ($RunIt) then
+      $cmd |& tee -a $LF
+      if ($status) goto error_exit
+    endif
+  endif
+
+  if ($doeddy) then
+    # Apply rotation from eddy-current correction to gradient vectors
+    if ($dorotbvecs) then
+      set cmd = xfmrot
+      if ($doeddy > 1) then		# From eddy
+        set cmd = ($cmd $dwidir/dwi.eddy_parameters)
+      else if ($doeddy == 1) then	# From eddy_correct
+        set cmd = ($cmd $dwidir/dwi.ecclog)
+      endif
+      set cmd = ($cmd $dwidir/dwi_orig_las.bvecs)
+      set cmd = ($cmd $dwidir/dwi.bvecs)
+      echo $cmd |& tee -a $LF |& tee -a $CF
+      if ($RunIt) then
+        $cmd |& tee -a $LF
+        if ($status) goto error_exit
+      endif
+    else
+      set cmd = (cp -p $dwidir/dwi_orig_las.bvecs $dwidir/dwi.bvecs)
+      echo $cmd |& tee -a $LF |& tee -a $CF
+      if ($RunIt) then
+        $cmd |& tee -a $LF
+        if ($status) goto error_exit
+      endif
+    endif
+
+    # Copy b-value table
+    set cmd = (cp -p $dwidir/dwi_orig_las.bvals $dwidir/dwi.bvals)
+    echo $cmd |& tee -a $LF |& tee -a $CF
+    if ($RunIt) then
+      $cmd |& tee -a $LF
+      if ($status) goto error_exit
+    endif
+  endif
+
+  if ($dob0 == 1) then			# B0 inhomogeneities: with field map
+    if ($doeddy) then
+      set cmd = (mv -f $dwidir/dwi.nii.gz $dwidir/dwi_eddy.nii.gz)
+      echo $cmd |& tee -a $LF |& tee -a $CF
+      if ($RunIt) then
+        $cmd |& tee -a $LF
+        if ($status) goto error_exit
+      endif
+
+      set indwi = dwi_eddy
+    else
+      set indwi = dwi_orig_las
+    endif
+
+    set cmd = (mri_convert --frame 0 $dwidir/$indwi.nii.gz $dwidir/lowb.nii.gz)
+    echo $cmd |& tee -a $LF |& tee -a $CF
+    if ($RunIt) then
+      $cmd |& tee -a $LF
+      if ($status) goto error_exit
+    endif
+
+    # Do I have one field map for all DWI runs or a different one for each run?
+    if (`printf '%s\n' $b0mfile | sort --unique | wc -l` == 1) then
+      set b0mfile = $b0mfile[1]
+      set b0pfile = $b0pfile[1]
+    endif
+
+    set nmap = $#b0mfile
+
+    set fstart = 0
+    set fend = 0
+    set flist = ()
+
+    @ imap = 1
+    while ($imap <= $nmap)		# For each input field map
+      if ($nmap == 1) then
+        set magbase = $dwidir/b0mag
+        set phabase = $dwidir/b0pha
+        set infbase = $dwidir/b0info
+        set dwibase = $dwidir/$indwi
+        set outbase = $dwidir/dwi
+      else
+        set magbase = $dwidir/b0mag.$imap
+        set phabase = $dwidir/b0pha.$imap
+        set infbase = $dwidir/b0info.$imap
+        set dwibase = $dwidir/dwi.$imap
+        set outbase = $dwidir/dwi.$imap
+
+        set flist = ($flist $outbase.nii.gz)
+
+        set nframe = `wc -w $dwidir/dwi_orig.$imap.bvals | awk '{print $1}'`
+        set fstart = $fend
+        set fend = `echo "$fstart + $nframe" | bc`
+
+        set cmd = mri_convert
+        set cmd = ($cmd --fsubsample $fstart 1 $fend)
+        set cmd = ($cmd $dwidir/$indwi.nii.gz)
+        set cmd = ($cmd $dwibase.nii.gz)
+        echo $cmd |& tee -a $LF |& tee -a $CF
+        if ($RunIt) then
+          $cmd |& tee -a $LF
+          if ($status) goto error_exit
+        endif
+      endif
+
+      # Magnitude maps
+      set infile = $b0mfile[$imap]
+      if ($#dcmroot > 0) set infile = $dcmroot/$infile
+
+      set cmd = (mri_convert $infile $magbase.nii.gz)
+      echo $cmd |& tee -a $LF |& tee -a $CF
+      if ($RunIt) then
+        $cmd |& tee -a $LF
+        if ($status) goto error_exit
+      endif
+
+      set cmd = (orientLAS $magbase.nii.gz $magbase.nii.gz)
+      echo $cmd |& tee -a $LF |& tee -a $CF
+      if ($RunIt) then
+        $cmd |& tee -a $LF
+        if ($status) goto error_exit
+      endif
+
+      # Phase maps
+      set infile = $b0pfile[$imap]
+      if ($#dcmroot > 0) set infile = $dcmroot/$infile
+
+      set cmd = (mri_convert $infile $phabase.nii.gz)
+      echo $cmd |& tee -a $LF |& tee -a $CF
+      if ($RunIt) then
+        $cmd |& tee -a $LF
+        if ($status) goto error_exit
+      endif
+
+      set cmd = (orientLAS $phabase.nii.gz $phabase.nii.gz)
+      echo $cmd |& tee -a $LF |& tee -a $CF
+      if ($RunIt) then
+        $cmd |& tee -a $LF
+        if ($status) goto error_exit
+      endif
+
+      # If dTE is not specified, use info from DICOM header to find it
+      if (($#dTE == 0) && (`mri_info --format $infile` =~ *dicom*)) then
+        set cmd = (mri_probedicom --i $infile)
+        echo "$cmd > $infbase.dat" |& tee -a $LF |& tee -a $CF
+        if ($RunIt) then
+          ($cmd > $infbase.dat) >>& $LF
+          if ($status) goto error_exit
+        endif
+
+        set TE = `grep alTE $infbase.dat | awk '{print $3}'`
+        set dTE = `echo "($TE[2] - $TE[1])/1000" | bc -l`
+      endif
+
+      if ($#dTE == 0) then
+        echo "ERROR: Need dTE for field map $infile" |& tee -a $LF
+        goto error_exit
+      endif
+
+      if ($#echospacing == 1) then
+        set esp = $echospacing
+      else
+        set esp = $echospacing[$imap]
+      endif
+      
+      if ($#dTE == 1) then
+        set tediff = $dTE
+      else
+        set tediff = $dTE[$imap]
+      endif
+      
+      set cmd = epidewarp.fsl
+      set cmd = ($cmd --mag $magbase.nii.gz)
+      if (`mri_info --nframes $phabase.nii.gz` == 2) then
+        set cmd = ($cmd --ph $phabase.nii.gz)	# Two phase maps
+      else if (`mri_info --nframes $phabase.nii.gz` == 1) then
+        set cmd = ($cmd --dph $phabase.nii.gz)	# Phase difference map
+      else
+        echo "ERROR: Unrecognized format of phase map $phabase.nii.gz" |& tee -a $LF
+        goto error_exit
+      endif
+      set cmd = ($cmd --exf $dwidir/lowb.nii.gz)
+      set cmd = ($cmd --epi $dwibase.nii.gz)
+      set cmd = ($cmd --tediff $tediff --esp $esp)
+      set cmd = ($cmd --vsm $dwidir/vsm.nii.gz)
+      set cmd = ($cmd --epidw $outbase.nii.gz)
+      echo $cmd |& tee -a $LF |& tee -a $CF
+      if ($RunIt) then
+        $fs_time $cmd |& tee -a $LF
+        if ($status) goto error_exit
+      endif
+
+      @ imap = $imap + 1
+    end
+
+    if ($nmap > 1) then
+      cmd = mri_concat
+      cmd = ($cmd --i $flist)
+      cmd = ($cmd --o $dwidir/dwi.nii.gz)
+      echo $cmd |& tee -a $LF |& tee -a $CF
+      if ($RunIt) then
+        $fs_time $cmd |& tee -a $LF
+        if ($status) goto error_exit
+      endif
+    endif
+  endif
+
+### TODO: TOPUP OUTPUT ONLY, NOT EDDY #
+  # In case FSL tools have wiped out the xform from the NIfTI header
+  if ($doeddy || $dob0) then		# Some correction has been applied
+    set cmd = mri_convert
+    if (-e $dwidir/dwi_orig_las.nii.gz) then
+      set cmd = ($cmd --in_like $dwidir/dwi_orig_las.nii.gz)
+    else
+      set cmd = ($cmd --in_like $dwidir/dwi_orig_las.1.nii.gz)
+    endif
+    set cmd = ($cmd $dwidir/dwi.nii.gz $dwidir/dwi.nii.gz)
+    echo $cmd |& tee -a $LF |& tee -a $CF
+    if ($RunIt) then
+      $fs_time $cmd |& tee -a $LF
+      if ($status) goto error_exit
+    endif
+  endif
+#######################################
+
+  # In case I have discarded frames before, clean up
+  set cmd = (rm -f $dwidir/dwi.full.nii.gz)
+  set cmd = ($cmd  $dwidir/dwi.bvecs.full $dwidir/dwi.bvals.full)
+  echo $cmd |& tee -a $LF |& tee -a $CF
+  if ($RunIt) then
+    $cmd |& tee -a $LF
+    if ($status) goto error_exit
+  endif
+
+  # Make diffusion brain mask
+  if ($#nb0 > 0) then
+    set lowblist = ()
+    @ k = 0
+    while ($k < $nb0)
+      set lowblist = ($lowblist $k)
+      @ k = $k + 1
+    end
+  else
+    set bmin = `grep -v ^$ $dwidir/dwi.bvals \
+                | sort --numeric-sort | head -n 1`
+    set lowblist = `cat $dwidir/dwi.bvals \
+                    | awk -v bmin=$bmin '{if ($1 == bmin) print NR-1}'`
+  endif
+
+  if (! $#lowblist) then
+    echo "ERROR: Cannot detect low-b volumes" |& tee -a $LF
+    goto error_exit
+  endif
+
+  set cmd = mri_convert
+  set cmd = ($cmd --frame $lowblist)
+  set cmd = ($cmd $dwidir/dwi.nii.gz)
+  set cmd = ($cmd $dwidir/lowb.nii.gz)
+  echo $cmd |& tee -a $LF |& tee -a $CF
+  if ($RunIt) then
+    $cmd |& tee -a $LF
+    if ($status) goto error_exit
+  endif
+
+  set cmd = mri_concat
+  set cmd = ($cmd --i $dwidir/lowb.nii.gz)
+  set cmd = ($cmd --mean)
+  set cmd = ($cmd --o $dwidir/lowb.nii.gz)
+  echo $cmd |& tee -a $LF |& tee -a $CF
+  if ($RunIt) then
+    $cmd |& tee -a $LF
+    if ($status) goto error_exit
+  endif
+
+  set cmd = bet
+  set cmd = ($cmd $dwidir/lowb.nii.gz)
+  set cmd = ($cmd $dwidir/lowb_brain.nii.gz)
+  set cmd = ($cmd -m -f $thrbet)
+  echo $cmd |& tee -a $LF |& tee -a $CF
+  if ($RunIt) then
+    $cmd |& tee -a $LF
+    if ($status) goto error_exit
+  endif
+
+  set cmd = (mv -f $dwidir/lowb_brain_mask.nii.gz $labdir/diff)
+  echo $cmd |& tee -a $LF |& tee -a $CF
+  if ($RunIt) then
+    $cmd |& tee -a $LF
+    if ($status) goto error_exit
+  endif
+endif
+
+if ($docorr && $dobase) then
+  echo "ERROR: Image correction step not available for base template" |& tee -a $LF
+  goto error_exit
+endif
+
+#------------ Select DWI set to use any subsequent steps ------------------#
+
+if (($docorr || $dotensor) && ! $dobase) then
+  echo "#-------------------------------------" |& tee -a $LF
+  echo "#@# DWI set selection `date`" |& tee -a $LF
+
+  # If using a subset of b-values
+  if ($#bmax) then			# Use all DWIs up to a maximum b-value
+    set dwiset = dwi.bmax$bmax
+
+    if ($docorr || ! -e $dwidir/$dwiset.nii.gz) then
+      set cmd = dmri_bset
+      set cmd = ($cmd --in   $dwidir/dwi.nii.gz)
+      set cmd = ($cmd --bmax $bmax)
+      set cmd = ($cmd --out  $dwidir/$dwiset.nii.gz)
+      echo $cmd |& tee -a $LF |& tee -a $CF
+      if ($RunIt) then
+        $cmd |& tee -a $LF
+        if ($status) goto error_exit
+      endif
+    endif
+  else if ($#bshell) then		# Use DWIs from one or more shells
+    set dwiset = dwi`printf '.b%s' $bshell`
+
+    if ($docorr || ! -e $dwidir/$dwiset.nii.gz) then
+      set cmd = dmri_bset
+      set cmd = ($cmd --in  $dwidir/dwi.nii.gz)
+      set cmd = ($cmd `printf '--b %s ' $bshell`)
+      set cmd = ($cmd --out $dwidir/$dwiset.nii.gz)
+      echo $cmd |& tee -a $LF |& tee -a $CF
+      if ($RunIt) then
+        $cmd |& tee -a $LF
+        if ($status) goto error_exit
+      endif
+    endif
+  else					# Use all DWIs
+    set dwiset = dwi
+  endif
+
+  set cmd = (ln -sf $dwiset.nii.gz $dwidir/data.nii.gz)
+  echo $cmd |& tee -a $LF |& tee -a $CF
+  if ($RunIt) then
+    $cmd |& tee -a $LF
+    if ($status) goto error_exit
+  endif
+
+  set cmd = (ln -sf $dwiset.bvecs $dwidir/bvecs)
+  echo $cmd |& tee -a $LF |& tee -a $CF
+  if ($RunIt) then
+    $cmd |& tee -a $LF
+    if ($status) goto error_exit
+  endif
+
+  set cmd = (ln -sf $dwiset.bvals $dwidir/bvals)
+  echo $cmd |& tee -a $LF |& tee -a $CF
+  if ($RunIt) then
+    $cmd |& tee -a $LF
+    if ($status) goto error_exit
+  endif
+endif
+
+#------------ Image quality assessment ------------------------------------#
+
+if ($doqa && ! $dobase) then
+  echo "#-------------------------------------" |& tee -a $LF
+  echo "#@# Image quality assessment `date`" |& tee -a $LF
+
+  # Find an intensity value that is representative of WM in low-b image
+  set imthr = `fslstats $dwidir/lowb.nii.gz \
+                     -k $labdir/diff/lowb_brain_mask.nii.gz -p 20`
+
+  set parfile = ()
+  if ($doeddy > 1) then
+    set parfile = $dwidir/dwi.eddy_parameters
+    if (! -e $parfile) then
+      echo "ERROR: Missing eddy output; need to run trac-all -corr" |& tee -a $LF
+      goto error_exit
+    endif
+  else if ($doeddy == 1) then
+    set parfile = $dwidir/dwi.ecclog
+    if (! -e $parfile) then
+      echo "ERROR: Missing eddy_correct output; need to run trac-all -corr" |& tee -a $LF
+      goto error_exit
+    endif
+  endif
+
+  set runs = `printf '%s\n' $dcmfile | awk '{print NR}'`
+  set dwiruns = `printf "$dwidir/dwi_orig.%d.nii.gz " $runs`
+  set bvalruns = `printf "$dwidir/dwi_orig.%d.bvals " $runs`
+
+  set cmd = $trcdir/dmri_motion
+  if ($#parfile) then
+    set cmd = ($cmd --mat $parfile)
+  endif
+  set cmd = ($cmd --dwi   $dwiruns)
+  set cmd = ($cmd --bval  $bvalruns)
+  set cmd = ($cmd --T     $imthr)
+  set cmd = ($cmd --out   $dwidir/dwi_motion.txt)
+  set cmd = ($cmd --outf  $dwidir/dwi_motion_byvol.txt)
+  echo $cmd |& tee -a $LF |& tee -a $CF
+  if ($RunIt) then
+    $cmd |& tee -a $LF
+    if ($status) goto error_exit
+  endif
+
+  if (-e $dwidir/keepframes.txt) then		# Remove bad frames
+    set keepframes = `cat $dwidir/keepframes.txt \
+                      | sort --numeric-sort --unique`
+
+    # Remove frames from DWI series
+    # If I have done this before, be careful not to overwrite the full set
+    if (! -e $dwidir/dwi.full.nii.gz) then
+      set cmd = (mv -f $dwidir/dwi.nii.gz $dwidir/dwi.full.nii.gz)
+      echo $cmd |& tee -a $LF |& tee -a $CF
+      if ($RunIt) then
+        $cmd |& tee -a $LF
+        if ($status) goto error_exit
+      endif
+    endif
+
+    set cmd = mri_convert
+    set cmd = ($cmd --frame $keepframes)
+    set cmd = ($cmd $dwidir/dwi.full.nii.gz)
+    set cmd = ($cmd $dwidir/dwi.nii.gz)
+    echo $cmd |& tee -a $LF |& tee -a $CF
+    if ($RunIt) then
+      $cmd |& tee -a $LF
+      if ($status) goto error_exit
+    endif
+
+    # Remove the respective gradient vectors and b-values
+    # If I have done this before, be careful not to overwrite the full set
+    set keepframes1 = `printf '%s\n' $keepframes | awk '{print $1+1}'`
+
+    foreach fname (dwi.bvecs dwi.bvals)
+      if (! -e $dwidir/$fname.full) then
+        set cmd = (mv -f $dwidir/$fname $dwidir/$fname.full)
+        echo $cmd |& tee -a $LF |& tee -a $CF
+        if ($RunIt) then
+          $cmd |& tee -a $LF
+          if ($status) goto error_exit
+        endif
+      endif
+
+      foreach iframe ($keepframes1)
+        set cmd = (sed -n ${iframe}p $dwidir/$fname.full)
+        echo "$cmd >> $dwidir/$fname" |& tee -a $LF |& tee -a $CF
+        if ($RunIt) then
+          ($cmd >> $dwidir/$fname) >>& $LF
+          if ($status) goto error_exit
+        endif
+      end
+    end
+  endif
+endif
+
+if ($doqa && $dobase) then
+  echo "ERROR: Image quality assessment step not available for base template" |& tee -a $LF
+  goto error_exit
+endif
+
+#------------ Intra-subject registration ----------------------------------#
+
+if ($dointra && ! $dobase && -e $fsdir/mri/brain.mgz) then
+  echo "#-------------------------------------" |& tee -a $LF
+  echo "#@# Intra-subject registration `date`" |& tee -a $LF
+
+  mkdir -p $labdir/anatorig $labdir/diff
+
+  set fslut = $FREESURFER_HOME/FreeSurferColorLUT.txt
+
+  if ($reg == flt) then
+    # Register low-b to anatomical using flirt
+    set cmd = fslregister
+    set cmd = ($cmd --s $subj)
+    set cmd = ($cmd --mov    $dwidir/lowb_brain.nii.gz)
+    set cmd = ($cmd --fsvol  brain)
+    set cmd = ($cmd --out    $dwidir/lowb_brain_anat_orig.$reg.nii.gz)
+    set cmd = ($cmd --reg    $xfmdir/diff2anatorig.$reg.dat)
+    set cmd = ($cmd --lta    $xfmdir/diff2anatorig.$reg.lta)
+    set cmd = ($cmd --cost $intracost --niters 2)
+    set cmd = ($cmd --dof $intradof --maxangle $intrarot)
+    echo $cmd |& tee -a $LF |& tee -a $CF
+    if ($RunIt) then
+      $fs_time $cmd |& tee -a $LF
+      if ($status) goto error_exit
+    endif
+  else if ($reg == bbr) then
+    # Register low-b to anatomical using bbregister
+    set cmd = bbregister
+    set cmd = ($cmd --s $subj)
+    set cmd = ($cmd --init-fsl --dti --$intradof)
+    set cmd = ($cmd --mov    $dwidir/lowb.nii.gz)
+    set cmd = ($cmd --reg    $xfmdir/diff2anatorig.$reg.lta)
+    echo $cmd |& tee -a $LF |& tee -a $CF
+    if ($RunIt) then
+      $fs_time $cmd |& tee -a $LF
+      if ($status) goto error_exit
+    endif
+  endif
+
+  set cmd = lta_convert
+  set cmd = ($cmd --inlta  $xfmdir/diff2anatorig.$reg.lta)
+  set cmd = ($cmd --invert)
+  set cmd = ($cmd --outlta $xfmdir/anatorig2diff.$reg.lta)
+  echo $cmd |& tee -a $LF |& tee -a $CF
+  if ($RunIt) then
+    $cmd |& tee -a $LF
+    if ($status) goto error_exit
+  endif
+
+  # Copy individual FreeSurfer segmentation (cross-sectional or longitudinal)
+  set cmd = mri_convert
+  set cmd = ($cmd $fsdir/mri/$segname.mgz)
+  set cmd = ($cmd $labdir/anatorig/$segname.nii.gz)
+  echo $cmd |& tee -a $LF |& tee -a $CF
+  if ($RunIt) then
+    $cmd |& tee -a $LF
+    if ($status) goto error_exit
+  endif
+
+  # Dilate segmentation to make brain mask
+  set cmd = mri_binarize
+  set cmd = ($cmd --i $labdir/anatorig/$segname.nii.gz)
+  set cmd = ($cmd --min .5 --dilate 4 --erode 2)
+  set cmd = ($cmd --o $labdir/anatorig/${segname}_mask.nii.gz)
+  echo $cmd |& tee -a $LF |& tee -a $CF
+  if ($RunIt) then
+    $cmd |& tee -a $LF
+    if ($status) goto error_exit
+  endif
+
+  if ($usethalnuc) then
+    set thalseg = ThalamicNuclei.v12.T1.FSvoxelSpace
+
+    if (! -e $fsdir/mri/$thalseg.mgz) then
+      echo "ERROR: Could not find $fsdir/mri/$thalseg.mgz" |& tee -a $LF
+      echo "ERROR: Thalamic nuclei segmentation is strongly recommended to use" |& tee -a $LF
+      echo "ERROR: for tracts that terminate in or travel near the thalamus" |& tee -a $LF
+      echo "ERROR: If there is good reason not to use it, set usethalnuc = 0" |& tee -a $LF
+      goto error_exit
+    endif
+
+    # Replace thalamus in main segmentation with nearest neighbor labels
+    set ids = ()
+    foreach label (Left-Thalamus Right-Thalamus)
+      set ids = ($ids `grep -i " ${label}[ \t]" $fslut | awk '{print $1}'`)
+    end
+
+    set cmd = mri_binarize
+    set cmd = ($cmd --i $fsdir/mri/$segname.mgz)
+    set cmd = ($cmd `printf "--replaceonly-nn %s 11 " $ids`)
+    set cmd = ($cmd --o $labdir/anatorig/${segname}+thalnuc.nii.gz)
+    echo $cmd
+    $cmd
+
+    # Merge main segmentation with thalamic nuclei segmentation
+    set cmd = mri_concat
+    set cmd = ($cmd --i $labdir/anatorig/${segname}+thalnuc.nii.gz)
+    set cmd = ($cmd --i $fsdir/mri/$thalseg.mgz)
+    set cmd = ($cmd --max)
+    set cmd = ($cmd --o $labdir/anatorig/${segname}+thalnuc.nii.gz)
+    echo $cmd
+    $cmd
+  endif
+
+  # Extract white-matter labels from segmentation
+  set wmlist = ( Left-Cerebral-White-Matter \
+                 Right-Cerebral-White-Matter \
+                 Left-Cerebellum-White-Matter \
+                 Right-Cerebellum-White-Matter \
+                 Vermis \
+                 Vermis-White-Matter \
+                 WM-hypointensities \
+                 Left-VentralDC \
+                 Right-VentralDC \
+                 Brain-Stem \
+                 Midbrain \
+                 Pons \
+                 Medulla )
+
+  # Make mask including cerebral WM, cerebellar WM, and WM hypointensities
+  set ids = ()
+  foreach label ($wmlist[1-7])
+    set ids = ($ids `grep -i " ${label}[ \t]" $fslut | awk '{print $1}'`)
+  end
+
+  set cmd = mri_binarize
+  set cmd = ($cmd --i $fsdir/mri/$segname.mgz)
+  set cmd = ($cmd --match $ids)
+  set cmd = ($cmd --o $labdir/anatorig/White-Matter.nii.gz)
+  echo $cmd |& tee -a $LF |& tee -a $CF
+  if ($RunIt) then
+    $cmd |& tee -a $LF
+    if ($status) goto error_exit
+  endif
+
+  # As above, plus ventral DC and brainstem
+  set ids = ()
+  foreach label ($wmlist)
+    set ids = ($ids `grep -i " ${label}[ \t]" $fslut | awk '{print $1}'`)
+  end
+
+  set cmd = mri_binarize
+  set cmd = ($cmd --i $fsdir/mri/$segname.mgz)
+  set cmd = ($cmd --match $ids)
+  set cmd = ($cmd --o $labdir/anatorig/White-Matter++.nii.gz)
+  echo $cmd |& tee -a $LF |& tee -a $CF
+  if ($RunIt) then
+    $cmd |& tee -a $LF
+    if ($status) goto error_exit
+  endif
+
+  # Map anatomical segmentation and mask to diffusion space
+  set labelist = ( $segname ${segname}_mask White-Matter White-Matter++ )
+  if ($usethalnuc)	set labelist = ( $labelist ${segname}+thalnuc )
+
+  foreach label ($labelist)
+    set cmd = mri_convert
+    set cmd = ($cmd -at $xfmdir/anatorig2diff.$reg.lta)
+    set cmd = ($cmd -rt nearest)				# Binary masks!
+    set cmd = ($cmd     $labdir/anatorig/$label.nii.gz)
+    set cmd = ($cmd     $labdir/diff/$label.$reg.nii.gz)
+    echo $cmd |& tee -a $LF |& tee -a $CF
+    if ($RunIt) then
+      $cmd |& tee -a $LF
+      if ($status) goto error_exit
+    endif
+  end
+
+  # Calculate SNR of DWIs in WM mask
+  set cmd = fslstats
+  set cmd = ($cmd -t $dwidir/dwi.nii.gz)
+  set cmd = ($cmd -k $labdir/diff/White-Matter++.$reg.nii.gz)
+  set cmd = ($cmd -m -s)
+  echo "$cmd | awk '{print "'$1/$2'"}' > $dwidir/dwi_snr.txt" \
+    |& tee -a $LF |& tee -a $CF
+  if ($RunIt) then
+    ($cmd | awk '{print $1/$2}' > $dwidir/dwi_snr.txt) >>& $LF
+  endif
+
+  # Map diffusion brain mask to individual anatomical space
+  set cmd = mri_convert
+  set cmd = ($cmd -at $xfmdir/diff2anatorig.$reg.lta)
+  set cmd = ($cmd -rt nearest)				# Binary masks!
+  set cmd = ($cmd     $labdir/diff/lowb_brain_mask.nii.gz)
+  set cmd = ($cmd     $labdir/anatorig/lowb_brain_mask.$reg.nii.gz)
+  echo $cmd |& tee -a $LF |& tee -a $CF
+  if ($RunIt) then
+    $cmd |& tee -a $LF
+    if ($status) goto error_exit
+  endif
+endif
+
+if ($dointra && $dobase) then
+  echo "#-------------------------------------" |& tee -a $LF
+  echo "#@# Intra-subject registration (base template) `date`" |& tee -a $LF
+
+  mkdir -p $labdir/anatorig
+
+  # Compute intersection of masks from all time points in base template space
+  foreach fname (${segname}_mask lowb_brain_mask.$reg)
+    set inlist = `printf "$dtroot/%s/dlabel/anatorig/$fname.nii.gz " $tplist`
+
+    set cmd = mri_concat
+    set cmd = ($cmd --i $inlist)
+    set cmd = ($cmd --min)
+    set cmd = ($cmd --o $labdir/anatorig/$fname.nii.gz)
+    echo $cmd |& tee -a $LF |& tee -a $CF
+    if ($RunIt) then
+      $cmd |& tee -a $LF
+      if ($status) goto error_exit
+    endif
+  end
+endif
+
+#------------ Tensor fit --------------------------------------------------#
+
+if ($dotensor && ! $dobase) then
+  echo "#-------------------------------------" |& tee -a $LF
+  echo "#@# Tensor fit `date`" |& tee -a $LF
+
+  if ($usemaskanat) then
+    set brainmask = $labdir/diff/${segname}_mask.$reg.nii.gz
+  else
+    set brainmask = $labdir/diff/lowb_brain_mask.nii.gz
+  endif
+
+  # LS tensor estimation
+  set cmd = dtifit
+  set cmd = ($cmd -k $dwidir/data.nii.gz)
+  set cmd = ($cmd -m $brainmask)
+  set cmd = ($cmd -r $dwidir/bvecs)
+  set cmd = ($cmd -b $dwidir/bvals)
+  set cmd = ($cmd -o $dwidir/dtifit)
+  echo $cmd |& tee -a $LF |& tee -a $CF
+  if ($RunIt) then
+    $fs_time $cmd |& tee -a $LF
+    if ($status) goto error_exit
+  endif
+endif
+
+if ($dotensor && $dobase) then
+  echo "ERROR: Tensor-fit step not available for base template" |& tee -a $LF
+  goto error_exit
+endif
+
+#------------ Inter-subject registration ----------------------------------#
+
+if ($dointer && ! $dobase) then
+  echo "#-------------------------------------" |& tee -a $LF
+  echo "#@# Inter-subject registration `date`" |& tee -a $LF
+
+  if ($xspace != syn && $xspace != fnt) then	# Check if individual T1 exists
+    if (! -e $fsdir/mri/brain.mgz) then
+      echo "ERROR: Could not find $fsdir/mri/brain.mgz" |& tee -a $LF
+      goto error_exit
+    endif
+  endif
+
+  if ($xspace == cvs) then
+    if ($subj == $cvstemp) then
+      if (-e $labdir/cvs && ! -l $labdir/cvs) rm -rf $labdir/cvs
+      ln -sfn ../anatorig $labdir/cvs
+    else
+      if (-l $labdir/cvs) rm -f $labdir/cvs
+      mkdir -p $labdir/cvs
+    endif
+  else
+    mkdir -p $labdir/$xspace
+  endif
+
+  if ($xspace == mni) then
+    # Copy anatomical brain
+    set cmd = mri_convert
+    set cmd = ($cmd $fsdir/mri/brain.mgz)
+    set cmd = ($cmd $dwidir/brain_anat_orig.nii.gz)
+    echo $cmd |& tee -a $LF |& tee -a $CF
+    if ($RunIt) then
+      $cmd |& tee -a $LF
+      if ($status) goto error_exit
+    endif
+
+    # Change orientation to LAS before running flirt to avoid flipping
+    set cmd = orientLAS
+    set cmd = ($cmd $dwidir/brain_anat_orig.nii.gz)
+    set cmd = ($cmd $dwidir/brain_anat.nii.gz)
+    echo $cmd |& tee -a $LF |& tee -a $CF
+    if ($RunIt) then
+      $cmd |& tee -a $LF
+      if ($status) goto error_exit
+    endif
+
+    # Register anatomical to MNI template
+    set cmd = flirt
+    set cmd = ($cmd -in $dwidir/brain_anat.nii.gz)
+    set cmd = ($cmd -ref $intertrg)
+    set cmd = ($cmd -out $dwidir/brain_anat_mni.nii.gz)
+    set cmd = ($cmd -omat $xfmdir/anat2mni.mat)
+    set cmd = ($cmd -cost $intercost)
+    echo $cmd |& tee -a $LF |& tee -a $CF
+    if ($RunIt) then
+      $fs_time $cmd |& tee -a $LF
+      if ($status) goto error_exit
+    endif
+
+    set cmd = lta_convert
+    set cmd = ($cmd --infsl  $xfmdir/anat2mni.mat)
+    set cmd = ($cmd --src    $dwidir/brain_anat.nii.gz)
+    set cmd = ($cmd --trg    $intertrg)
+    set cmd = ($cmd --outlta $xfmdir/anat2mni.lta)
+    echo $cmd |& tee -a $LF |& tee -a $CF
+    if ($RunIt) then
+      $cmd |& tee -a $LF
+      if ($status) goto error_exit
+    endif
+
+    # Calculate original anatomical to LAS anatomical
+    set cmd = tkregister2
+    set cmd = ($cmd --mov     $dwidir/brain_anat_orig.nii.gz)
+    set cmd = ($cmd --targ    $dwidir/brain_anat.nii.gz)
+    set cmd = ($cmd --regheader --noedit)
+    set cmd = ($cmd --reg     $xfmdir/anatorig2anat.dat)
+    set cmd = ($cmd --ltaout  $xfmdir/anatorig2anat.lta)
+    echo $cmd |& tee -a $LF |& tee -a $CF
+    if ($RunIt) then
+      $cmd |& tee -a $LF
+      if ($status) goto error_exit
+    endif
+
+    # Calculate original anatomical to MNI template
+    set cmd = mri_concatenate_lta
+    set cmd = ($cmd $xfmdir/anatorig2anat.lta)
+    set cmd = ($cmd $xfmdir/anat2mni.lta)
+    set cmd = ($cmd $xfmdir/anatorig2mni.lta)
+    echo $cmd |& tee -a $LF |& tee -a $CF
+    if ($RunIt) then
+      $cmd |& tee -a $LF
+      if ($status) goto error_exit
+    endif
+
+    set cmd = lta_convert
+    set cmd = ($cmd --inlta  $xfmdir/anatorig2mni.lta)
+    set cmd = ($cmd --invert)
+    set cmd = ($cmd --outlta $xfmdir/mni2anatorig.lta)
+    echo $cmd |& tee -a $LF |& tee -a $CF
+    if ($RunIt) then
+      $cmd |& tee -a $LF
+      if ($status) goto error_exit
+    endif
+
+    # Calculate low-b to MNI template
+    set cmd = mri_concatenate_lta
+    set cmd = ($cmd $xfmdir/diff2anatorig.$reg.lta)
+    set cmd = ($cmd $xfmdir/anatorig2mni.lta)
+    set cmd = ($cmd $xfmdir/diff2mni.$reg.lta)
+    echo $cmd |& tee -a $LF |& tee -a $CF
+    if ($RunIt) then
+      $cmd |& tee -a $LF
+      if ($status) goto error_exit
+    endif
+
+    set cmd = lta_convert
+    set cmd = ($cmd --inlta  $xfmdir/diff2mni.$reg.lta)
+    set cmd = ($cmd --invert)
+    set cmd = ($cmd --outlta $xfmdir/mni2diff.$reg.lta)
+    echo $cmd |& tee -a $LF |& tee -a $CF
+    if ($RunIt) then
+      $cmd |& tee -a $LF
+      if ($status) goto error_exit
+    endif
+  else if ($xspace == rob) then
+    # Register anatomical to robust template
+    set cmd = mri_robust_register
+    set cmd = ($cmd --mov    $fsdir/mri/brain.mgz)
+    set cmd = ($cmd --dst    $intertrg)
+    set cmd = ($cmd --mapmov $dwidir/brain_anat_orig_rob.nii.gz)
+    set cmd = ($cmd --lta    $xfmdir/anatorig2rob.lta)
+    set cmd = ($cmd --affine --cost ROB --iscale --satit)
+    echo $cmd |& tee -a $LF |& tee -a $CF
+    if ($RunIt) then
+      $cmd |& tee -a $LF
+      if ($status) goto error_exit
+    endif
+
+    set cmd = lta_convert
+    set cmd = ($cmd --inlta  $xfmdir/anatorig2rob.lta)
+    set cmd = ($cmd --invert)
+    set cmd = ($cmd --outlta $xfmdir/rob2anatorig.lta)
+    echo $cmd |& tee -a $LF |& tee -a $CF
+    if ($RunIt) then
+      $cmd |& tee -a $LF
+      if ($status) goto error_exit
+    endif
+
+    # Calculate low-b to template
+    set cmd = mri_concatenate_lta
+    set cmd = ($cmd $xfmdir/diff2anatorig.$reg.lta)
+    set cmd = ($cmd $xfmdir/anatorig2rob.lta)
+    set cmd = ($cmd $xfmdir/diff2rob.$reg.lta)
+    echo $cmd |& tee -a $LF |& tee -a $CF
+    if ($RunIt) then
+      $cmd |& tee -a $LF
+      if ($status) goto error_exit
+    endif
+
+    set cmd = lta_convert
+    set cmd = ($cmd --inlta  $xfmdir/diff2rob.$reg.lta)
+    set cmd = ($cmd --invert)
+    set cmd = ($cmd --outlta $xfmdir/rob2diff.$reg.lta)
+    echo $cmd |& tee -a $LF |& tee -a $CF
+    if ($RunIt) then
+      $cmd |& tee -a $LF
+      if ($status) goto error_exit
+    endif
+  else if ($xspace == cvs) then
+    if ($subj == $cvstemp) then
+      set cmd = (rm -f $xfmdir/cvs)
+      echo $cmd |& tee -a $LF |& tee -a $CF
+      if ($RunIt) then
+        $cmd |& tee -a $LF
+        if ($status) goto error_exit
+      endif
+    else
+      # Create morph of anatomical to CVS template if it doesn't exist
+      if (-e $fsdir/cvs/el_reg_to$cvstemp.mgz) then
+        set cmd = (ln -sfn $fsdir/cvs $xfmdir/cvs)
+        echo $cmd |& tee -a $LF |& tee -a $CF
+        if ($RunIt) then
+          $cmd |& tee -a $LF
+          if ($status) goto error_exit
+        endif
+      else
+        mkdir -p $fsdir/cvs/$cvstemp
+
+        set cmd = (ln -sfn $fsdir/cvs/$cvstemp $xfmdir/cvs)
+        echo $cmd |& tee -a $LF |& tee -a $CF
+        if ($RunIt) then
+          $cmd |& tee -a $LF
+          if ($status) goto error_exit
+        endif
+      endif
+
+      if (! -e $xfmdir/cvs/$cvswarp.m3z) then
+        set oldcvswarp = combined_to${cvstemp}_elreg_afteraseg-norm
+
+        if (-e $xfmdir/cvs/$oldcvswarp.m3z) then
+          # If 2nd-generation CVS was run,
+          # make symlink with 3rd-generation naming
+          set cmd = (ln -s ./$oldcvswarp.m3z $xfmdir/cvs/$cvswarp.m3z)
+          echo $cmd |& tee -a $LF |& tee -a $CF
+          if ($RunIt) then
+            $cmd |& tee -a $LF
+            if ($status) goto error_exit
+          endif
+        else
+          if (! -e $SUBJECTS_DIR/$cvstemp) then
+            if (! -e $cvstempdir/$cvstemp) then
+              echo "ERROR: Could not find CVS template $cvstempdir/$cvstemp" |& tee -a $LF
+              goto error_exit
+            endif
+
+            set cmd = (ln -s $cvstempdir/$cvstemp $SUBJECTS_DIR)
+            echo $cmd |& tee -a $LF |& tee -a $CF
+            if ($RunIt) then
+              $cmd |& tee -a $LF
+              if ($status) goto error_exit
+            endif
+          endif
+
+          if (! -e $xfmdir/cvs/nlalign-afteraseg-norm.m3z) then
+            # Register anatomical to CVS template
+            set cmd = mri_cvs_register
+            set cmd = ($cmd --mov $subj)
+            set cmd = ($cmd --template $cvstemp)
+            set cmd = ($cmd --outdir $xfmdir/cvs)
+            set cmd = ($cmd --cleanall)
+            echo $cmd |& tee -a $LF |& tee -a $CF
+            if ($RunIt) then
+              $fs_time $cmd |& tee -a $LF
+              if ($status) goto error_exit
+            endif
+          else		# 1st-generation mri_cvs_register has been run
+            if (! -e $xfmdir/cvs/$cvswarp.tm3d) then
+              # Recreate full morph .tm3d from its components
+              set cmd = createMorph
+              set cmd = ($cmd --out $xfmdir/cvs/$cvswarp.tm3d)
+              set cmd = ($cmd --template $intertrg)
+              set cmd = ($cmd --subject $fsdir/mri/norm.mgz)
+              set cmd = ($cmd --in gcam $xfmdir/cvs/nlalign-afteraseg-norm.m3z)
+              set cmd = ($cmd      morph $xfmdir/cvs/el_reg_to$cvstemp.tm3d)
+              echo $cmd |& tee -a $LF |& tee -a $CF
+              if ($RunIt) then
+                $fs_time $cmd |& tee -a $LF
+                if ($status) goto error_exit
+              endif
+            endif
+
+            # Convert .tm3d to .m3z
+            set cmd = exportGcam
+            set cmd = ($cmd --morph    $xfmdir/cvs/$cvswarp.tm3d)
+            set cmd = ($cmd --fixed    $intertrg)
+            set cmd = ($cmd --moving   $fsdir/mri/norm.mgz)
+            set cmd = ($cmd --out_gcam $xfmdir/cvs/$cvswarp.m3z)
+            echo $cmd |& tee -a $LF |& tee -a $CF
+            if ($RunIt) then
+              $fs_time $cmd |& tee -a $LF
+              if ($status) goto error_exit
+            endif
+          endif
+        endif
+      endif
+    endif
+  else if ($xspace == syn) then
+    if (! $?ANTSPATH) then
+      echo "ERROR: must set ANTSPATH environment variable to use ANTs" |& tee -a $LF
+      goto error_exit
+    endif
+
+    # Register FA nonlinearly to FA template with SyN
+    set cmd = $ANTSPATH/antsRegistrationSyNQuick.sh
+    set cmd = ($cmd -d 3)
+    set cmd = ($cmd -m $dwidir/dtifit_FA.nii.gz)
+    set cmd = ($cmd -f $intertrg)
+    set cmd = ($cmd -o $xfmdir/diff2syn)
+    echo $cmd |& tee -a $LF |& tee -a $CF
+    if ($RunIt) then
+      $cmd |& tee -a $LF
+      if ($status) goto error_exit
+    endif
+
+    # Convert affine transform to .lta
+    set cmd = $ANTSPATH/ConvertTransformFile
+    set cmd = ($cmd 3 $xfmdir/diff2syn0GenericAffine.mat)
+    set cmd = ($cmd   $xfmdir/diff2syn0GenericAffine.txt)
+    set cmd = ($cmd --hm --ras)
+    echo $cmd |& tee -a $LF |& tee -a $CF
+    if ($RunIt) then
+      $cmd |& tee -a $LF
+      if ($status) goto error_exit
+    endif
+
+    set cmd = lta_convert
+    set cmd = ($cmd --inniftyreg $xfmdir/diff2syn0GenericAffine.txt)
+    set cmd = ($cmd --outlta     $xfmdir/diff2syn.lta)
+    set cmd = ($cmd --src        $dwidir/dtifit_FA.nii.gz)
+    set cmd = ($cmd --trg        $intertrg)
+    echo $cmd |& tee -a $LF |& tee -a $CF
+    if ($RunIt) then
+      $cmd |& tee -a $LF
+      if ($status) goto error_exit
+    endif
+
+    # Convert nonlinear warp to .m3z
+    set cmd = mri_warp_convert
+    set cmd = ($cmd --initk     $xfmdir/diff2syn1Warp.nii.gz)
+    set cmd = ($cmd --outm3z    $xfmdir/syn_warp.m3z)
+    set cmd = ($cmd --insrcgeom $intertrg)
+    echo $cmd |& tee -a $LF |& tee -a $CF
+    if ($RunIt) then
+      $cmd |& tee -a $LF
+      if ($status) goto error_exit
+    endif
+
+    # Calculate affine from template to individual diffusion
+    set cmd = lta_convert
+    set cmd = ($cmd --inlta  $xfmdir/diff2syn.lta)
+    set cmd = ($cmd --invert)
+    set cmd = ($cmd --outlta $xfmdir/syn2diff.lta)
+    echo $cmd |& tee -a $LF |& tee -a $CF
+    if ($RunIt) then
+      $cmd |& tee -a $LF
+      if ($status) goto error_exit
+    endif
+
+    # Calculate affine from individual anatomical to template
+    set cmd = mri_concatenate_lta
+    set cmd = ($cmd $xfmdir/anatorig2diff.$reg.lta)
+    set cmd = ($cmd $xfmdir/diff2syn.lta)
+    set cmd = ($cmd $xfmdir/anatorig2syn.$reg.lta)
+    echo $cmd |& tee -a $LF |& tee -a $CF
+    if ($RunIt) then
+      $cmd |& tee -a $LF
+      if ($status) goto error_exit
+    endif
+
+    # Calculate affine from template to individual anatomical
+    set cmd = lta_convert
+    set cmd = ($cmd --inlta  $xfmdir/anatorig2syn.$reg.lta)
+    set cmd = ($cmd --invert)
+    set cmd = ($cmd --outlta $xfmdir/syn2anatorig.$reg.lta)
+    echo $cmd |& tee -a $LF |& tee -a $CF
+    if ($RunIt) then
+      $cmd |& tee -a $LF
+      if ($status) goto error_exit
+    endif
+
+    # Create identity transform in template space
+    printf '1 0 0 0\n0 1 0 0\n0 0 1 0\n0 0 0 1' > $xfmdir/identity.mat
+
+    set cmd = lta_convert
+    set cmd = ($cmd --infsl  $xfmdir/identity.mat)
+    set cmd = ($cmd --outlta $xfmdir/syn2syn.lta)
+    set cmd = ($cmd --src    $intertrg)
+    set cmd = ($cmd --trg    $intertrg)
+    echo $cmd |& tee -a $LF |& tee -a $CF
+    if ($RunIt) then
+      $cmd |& tee -a $LF
+      if ($status) goto error_exit
+    endif
+  else if ($xspace == fnt) then
+    # Register FA nonlinearly to FA template with FNIRT
+    set cmd = fsl_reg
+    set cmd = ($cmd $dwidir/dtifit_FA.nii.gz)
+    set cmd = ($cmd $intertrg)
+    set cmd = ($cmd $xfmdir/diff2fsl)
+    set cmd = ($cmd -e -FA)
+    echo $cmd |& tee -a $LF |& tee -a $CF
+    if ($RunIt) then
+      $cmd |& tee -a $LF
+      if ($status) goto error_exit
+    endif
+
+    # Calculate template to individual diffusion
+    set cmd = invwarp
+    set cmd = ($cmd -r $dwidir/dtifit_FA.nii.gz)
+    set cmd = ($cmd -w $xfmdir/diff2fsl_warp)
+    set cmd = ($cmd -o $xfmdir/fsl2diff_warp)
+    echo $cmd |& tee -a $LF |& tee -a $CF
+    if ($RunIt) then
+      $cmd |& tee -a $LF
+      if ($status) goto error_exit
+    endif
+
+    # Calculate individual anatomical to template
+    set cmd = lta_convert
+    set cmd = ($cmd --inlta  $xfmdir/anatorig2diff.$reg.lta)
+    set cmd = ($cmd --outfsl $xfmdir/anatorig2diff.$reg.mat)
+    echo $cmd |& tee -a $LF |& tee -a $CF
+    if ($RunIt) then
+      $cmd |& tee -a $LF
+      if ($status) goto error_exit
+    endif
+
+    set cmd = convertwarp
+    set cmd = ($cmd -r $intertrg)
+    set cmd = ($cmd -m $xfmdir/anatorig2diff.$reg.mat)
+    set cmd = ($cmd -w $xfmdir/diff2fsl_warp)
+    set cmd = ($cmd -o $xfmdir/anatorig2fsl_warp.$reg)
+    echo $cmd |& tee -a $LF |& tee -a $CF
+    if ($RunIt) then
+      $cmd |& tee -a $LF
+      if ($status) goto error_exit
+    endif
+
+    # Convert original warp to .m3z
+    set cmd = mri_warp_convert
+    set cmd = ($cmd --infsl  $xfmdir/diff2fsl_warp.nii.gz)
+    set cmd = ($cmd --outm3z $xfmdir/diff2fsl_warp.m3z)
+    echo $cmd |& tee -a $LF |& tee -a $CF
+    if ($RunIt) then
+      $cmd |& tee -a $LF
+      if ($status) goto error_exit
+    endif
+  endif
+
+  # Map anatomical segmentation and mask to template space
+  set labelist = ( $segname ${segname}_mask White-Matter White-Matter++ )
+  if ($usethalnuc)	set labelist = ( $labelist ${segname}+thalnuc )
+
+  foreach label ($labelist)
+    if (! -e $labdir/anatorig/$label.nii.gz) then
+      echo "WARN: Could not find $labdir/anatorig/$label.nii.gz"
+      continue
+    endif
+
+    if ($xspace == mni || $xspace == rob) then
+      set cmd = mri_convert
+      set cmd = ($cmd -at $xfmdir/anatorig2$xspace.lta)
+      set cmd = ($cmd -rt nearest)				# Binary masks!
+      set cmd = ($cmd     $labdir/anatorig/$label.nii.gz)
+      set cmd = ($cmd     $labdir/$xspace/$label.nii.gz)
+      echo $cmd |& tee -a $LF |& tee -a $CF
+      if ($RunIt) then
+        $cmd |& tee -a $LF
+        if ($status) goto error_exit
+      endif
+    else if ($xspace == cvs) then
+      set cmd = mri_vol2vol
+      set cmd = ($cmd --mov  $labdir/anatorig/$label.nii.gz)
+      set cmd = ($cmd --targ $intertrg)
+      set cmd = ($cmd --o    $labdir/cvs/$label.nii.gz)
+      set cmd = ($cmd --m3z  $xfmdir/cvs/$cvswarp.m3z)
+      set cmd = ($cmd --noDefM3zPath)
+      set cmd = ($cmd --interp nearest)			# Binary masks!
+      set cmd = ($cmd --no-save-reg)
+      echo $cmd |& tee -a $LF |& tee -a $CF
+      if ($RunIt) then
+        $fs_time $cmd |& tee -a $LF
+        if ($status) goto error_exit
+      endif
+    else if ($xspace == syn) then
+      set cmd = mri_vol2vol
+      set cmd = ($cmd --gcam $labdir/anatorig/$label.nii.gz)
+      set cmd = ($cmd        $xfmdir/anatorig2syn.$reg.lta)
+      set cmd = ($cmd        $xfmdir/syn_warp.m3z)
+      set cmd = ($cmd        $xfmdir/syn2syn.lta 0 0)		# Binary masks!
+      set cmd = ($cmd        $labdir/syn/$label.nii.gz)
+      echo $cmd |& tee -a $LF |& tee -a $CF
+      if ($RunIt) then
+        $cmd |& tee -a $LF
+        if ($status) goto error_exit
+      endif
+    else if ($xspace == fnt) then
+      set cmd = applywarp
+      set cmd = ($cmd -w $xfmdir/anatorig2fsl_warp.$reg --rel)
+      set cmd = ($cmd -i $labdir/anatorig/$label.nii.gz)
+      set cmd = ($cmd -r $intertrg)
+      set cmd = ($cmd -o $labdir/fnt/$label.nii.gz)
+      set cmd = ($cmd --interp=nn)				# Binary masks!
+      echo $cmd |& tee -a $LF |& tee -a $CF
+      if ($RunIt) then
+        $cmd |& tee -a $LF
+        if ($status) goto error_exit
+      endif
+    endif
+  end
+
+  # Map diffusion brain mask to template space
+  if ($xspace == mni || $xspace == rob) then
+    set cmd = mri_convert
+    set cmd = ($cmd -at $xfmdir/diff2$xspace.$reg.lta)
+    set cmd = ($cmd -rt nearest)				# Binary masks!
+    set cmd = ($cmd     $labdir/diff/lowb_brain_mask.nii.gz)
+    set cmd = ($cmd     $labdir/$xspace/lowb_brain_mask.$reg.nii.gz)
+    echo $cmd |& tee -a $LF |& tee -a $CF
+    if ($RunIt) then
+      $cmd |& tee -a $LF
+      if ($status) goto error_exit
+    endif
+  else if ($xspace == cvs) then
+    set cmd = mri_vol2vol
+    set cmd = ($cmd --mov  $labdir/anatorig/lowb_brain_mask.$reg.nii.gz)
+    set cmd = ($cmd --targ $intertrg)
+    set cmd = ($cmd --o    $labdir/cvs/lowb_brain_mask.$reg.nii.gz)
+    set cmd = ($cmd --m3z  $xfmdir/cvs/$cvswarp.m3z)
+    set cmd = ($cmd --noDefM3zPath)
+    set cmd = ($cmd --interp nearest)				# Binary masks!
+    set cmd = ($cmd --no-save-reg)
+    echo $cmd |& tee -a $LF |& tee -a $CF
+    if ($RunIt) then
+      $cmd |& tee -a $LF
+      if ($status) goto error_exit
+    endif
+  else if ($xspace == syn) then
+    set cmd = mri_vol2vol
+    set cmd = ($cmd --gcam $labdir/diff/lowb_brain_mask.nii.gz)
+    set cmd = ($cmd        $xfmdir/diff2syn.lta)
+    set cmd = ($cmd        $xfmdir/syn_warp.m3z)
+    set cmd = ($cmd        $xfmdir/syn2syn.lta 0 0)		# Binary masks!
+    set cmd = ($cmd        $labdir/syn/lowb_brain_mask.nii.gz)
+    echo $cmd |& tee -a $LF |& tee -a $CF
+    if ($RunIt) then
+      $cmd |& tee -a $LF
+      if ($status) goto error_exit
+    endif
+  else if ($xspace == fnt) then
+    set cmd = applywarp
+    set cmd = ($cmd -w $xfmdir/diff2fsl_warp --rel)
+    set cmd = ($cmd -i $labdir/diff/lowb_brain_mask.nii.gz)
+    set cmd = ($cmd -r $intertrg)
+    set cmd = ($cmd -o $labdir/fnt/lowb_brain_mask.nii.gz)
+    set cmd = ($cmd --interp=nn)				# Binary masks!
+    echo $cmd |& tee -a $LF |& tee -a $CF
+    if ($RunIt) then
+      $cmd |& tee -a $LF
+      if ($status) goto error_exit
+    endif
+  endif
+endif
+
+if ($dointer && $dobase) then
+  echo "#-------------------------------------" |& tee -a $LF
+  echo "#@# Inter-subject registration (base template) `date`" |& tee -a $LF
+
+  # Hack: Using one time point for now!
+  # Replace with within-subject template to between-subject template
+  set dwidir_t = $dtroot/$tplist[1]/dmri
+  set xfmdir_t = $dwidir_t/xfms
+
+  if ($xspace == mni || $xspace == rob) then
+    # Affine registration from MNI template to base template
+    set cmd = cp
+    set cmd = ($cmd $xfmdir_t/${xspace}2anatorig.lta)
+    set cmd = ($cmd $xfmdir_t/anatorig2$xspace.lta)
+    set cmd = ($cmd $xfmdir)
+    echo $cmd |& tee -a $LF |& tee -a $CF
+    if ($RunIt) then
+      $cmd |& tee -a $LF
+      if ($status) goto error_exit
+    endif
+  else if ($xspace == syn) then
+    # Non-linear registration from SyN FA template to base template
+    set cmd = cp
+    set cmd = ($cmd $xfmdir_t/syn2anatorig.$reg.lta)
+    set cmd = ($cmd $xfmdir_t/anatorig2syn.$reg.lta)
+    set cmd = ($cmd $xfmdir_t/syn_warp.m3z)
+    set cmd = ($cmd $xfmdir)
+    echo $cmd |& tee -a $LF |& tee -a $CF
+    if ($RunIt) then
+      $cmd |& tee -a $LF
+      if ($status) goto error_exit
+    endif
+  else if ($xspace == fnt) then
+    # Non-linear registration from fnirt FA template to base template
+    set cmd = cp
+    set cmd = ($cmd $xfmdir_t/diff2anatorig.$reg.lta)
+    set cmd = ($cmd $xfmdir_t/anatorig2diff.$reg.lta)
+    set cmd = ($cmd $xfmdir_t/diff2fsl_warp.m3z)
+    set cmd = ($cmd $xfmdir)
+    echo $cmd |& tee -a $LF |& tee -a $CF
+    if ($RunIt) then
+      $cmd |& tee -a $LF
+      if ($status) goto error_exit
+    endif
+
+    set cmd = cp
+    set cmd = ($cmd $dwidir_t/dtifit_FA.nii.gz)
+    set cmd = ($cmd $dwidir)
+    echo $cmd |& tee -a $LF |& tee -a $CF
+    if ($RunIt) then
+      $cmd |& tee -a $LF
+      if ($status) goto error_exit
+    endif
+  endif
+endif
+
+#------------ Combine training data ---------------------------------------#
+
+if ($dopriors && ! $dobase) then
+  echo "#-------------------------------------" |& tee -a $LF
+  echo "#@# Priors `date`" |& tee -a $LF
+
+  foreach ntrain ($ntrainlist)
+    # Use a subset of the training subjects
+    set slistfile = `fs_temp_file --suffix .$ntrain.$subj.txt`
+    printf '%s\n' $trainsubjlist[1-$ntrain] > $slistfile
+
+    set avgmode = $avgname${ntrain}_${xspace}_$reg
+
+    set outdir = $labdir/$xspace
+    set outlist = `printf "%s_$avgmode " $pathlist`
+
+    set trklist = `printf "$xspace/%s.$reg.prep.trk " $pathlist`
+
+    if ($usemaskanat) then
+      set brainmask = $labdir/$xspace/${segname}_mask.nii.gz
+    else
+      set brainmask = $labdir/$xspace/lowb_brain_mask.$reg.nii.gz
+    endif
+
+    if ($reinit) then	# Exclude previous spline initialization
+      foreach outbase ($outlist)
+        set oldinit = $outdir/${outbase}_cpts_all.txt
+
+        if (-e $oldinit) then
+          set excfile = $outdir/${outbase}_cpts_all.bad.txt
+          echo exclude >> $excfile
+          cat $oldinit >> $excfile
+        endif
+      end
+    endif
+
+    # Compute priors, end ROIs, and initial control points from training set
+    set cmd = $trcdir/dmri_train
+    set cmd = ($cmd --outdir $outdir)
+    set cmd = ($cmd --out    $outlist)
+    set cmd = ($cmd --slist  $slistfile)
+    set cmd = ($cmd --trk    $trklist)
+    if ($usethalnuc) then
+      set cmd = ($cmd --seg  $xspace/${segname}+thalnuc.nii.gz)
+    else
+      set cmd = ($cmd --seg  $xspace/$segname.nii.gz)
+    endif
+    set cmd = ($cmd --cmask  $xspace/cortex+${gmgrow}mm+crblm.nii.gz)
+    set cmd = ($cmd --lmask  $gmids)
+    set cmd = ($cmd --bmask  $brainmask)
+    set cmd = ($cmd --fa     $dwidir/dtifit_FA.nii.gz)
+    set cmd = ($cmd --cptdir $labdir/diff)
+    if ($xspace == mni || $xspace == rob) then
+      set cmd = ($cmd --reg   $xfmdir/${xspace}2diff.$reg.lta)
+    else if ($xspace == cvs) then
+      set cmd = ($cmd --regnl $xfmdir/cvs/$cvswarp.m3z)
+      set cmd = ($cmd --refnl $dwidir/brain_anat_orig.nii.gz)
+      set cmd = ($cmd --reg   $xfmdir/anatorig2diff.$reg.lta)
+    else if ($xspace == syn) then
+      set cmd = ($cmd --regnl $xfmdir/syn_warp.m3z)
+      set cmd = ($cmd --refnl $intertrg)
+      set cmd = ($cmd --reg   $xfmdir/syn2diff.lta)
+    else if ($xspace == fnt) then
+      set cmd = ($cmd --regnl $xfmdir/diff2fsl_warp.m3z)
+      set cmd = ($cmd --refnl $dwidir/dtifit_FA.nii.gz)
+    endif
+    set cmd = ($cmd --ncpts $ncpts)
+    if ($reinit)      set cmd = ($cmd --xstr)
+    if ($usetrunc)    set cmd = ($cmd --trunc)
+    if ($dosegprior)  set cmd = ($cmd --aprior)
+    if ($dotangprior) set cmd = ($cmd --sprior)
+    if ($debug)       set cmd = ($cmd --debug)
+    echo $cmd |& tee -a $LF |& tee -a $CF
+    if ($RunIt) then
+      $fs_time $cmd |& tee -a $LF
+      if ($status) goto error_exit
+    endif
+  end
+endif
+
+if ($dopriors && $dobase) then
+  echo "#-------------------------------------" |& tee -a $LF
+  echo "#@# Priors (base template) `date`" |& tee -a $LF
+
+  mkdir -p $labdir/$xspace
+
+  foreach ntrain ($ntrainlist)
+    # Use a subset of the training subjects
+    set slistfile = /tmp/subj$ntrain.$subj.$$.txt
+    printf '%s\n' $trainsubjlist[1-$ntrain] > $slistfile
+
+    set avgmode = $avgname${ntrain}_${xspace}_$reg
+
+    set outdir = $labdir/$xspace
+    set outlist = `printf "%s_$avgmode " $pathlist`
+
+    set trklist = `printf "$xspace/%s.$reg.prep.trk " $pathlist`
+
+    if ($usemaskanat) then
+      set brainmask = ${segname}_mask.nii.gz
+    else
+      set brainmask = lowb_brain_mask.$reg.nii.gz
+    endif
+
+    set bmasklist = `printf "$dtroot/%s/dlabel/$xspace/$brainmask " $tplist`
+
+    set falist = `printf "$dtroot/%s/dmri/dtifit_FA.nii.gz " $tplist`
+
+    set basereglist = \
+      `printf "$dtroot/%s/dmri/xfms/anatorig2diff.$reg.lta " $tplist`
+
+    if ($reinit) then	# Exclude previous spline initialization
+      foreach outbase ($outlist)
+        set oldinit = $outdir/${outbase}_cpts_all.txt
+
+        if (-e $oldinit) then
+          set excfile = $outdir/${outbase}_cpts_all.bad.txt
+          echo exclude >> $excfile
+          cat $oldinit >> $excfile
+        endif
+      end
+    endif
+
+    # Compute priors, end ROIs, and initial control points from training set
+    set cmd = $trcdir/dmri_train
+    set cmd = ($cmd --outdir  $outdir)
+    set cmd = ($cmd --out     $outlist)
+    set cmd = ($cmd --slist   $slistfile)
+    set cmd = ($cmd --trk     $trklist)
+    if ($usethalnuc) then
+      set cmd = ($cmd --seg   $xspace/${segname}+thalnuc.nii.gz)
+    else
+      set cmd = ($cmd --seg   $xspace/$segname.nii.gz)
+    endif
+    set cmd = ($cmd --cmask   $xspace/cortex+${gmgrow}mm+crblm.nii.gz)
+    set cmd = ($cmd --lmask   $gmids)
+    set cmd = ($cmd --bmask   $bmasklist)
+    set cmd = ($cmd --fa      $falist)
+    set cmd = ($cmd --cptdir  $labdir/anatorig)
+    if ($xspace == mni || $xspace == rob) then
+      set cmd = ($cmd --reg   $xfmdir/${xspace}2anatorig.lta)
+    else if ($xspace == cvs) then
+      # Hack: Using one time point for now!
+      set dwidir_t = $dtroot/$tplist[1]/dmri
+      set xfmdir_t = $dwidir_t/xfms
+      set cmd = ($cmd --regnl $xfmdir_t/cvs/$cvswarp.m3z)
+      set cmd = ($cmd --refnl $dwidir_t/brain_anat_orig.nii.gz)
+    else if ($xspace == syn) then
+      set cmd = ($cmd --regnl $xfmdir/syn_warp.m3z)
+      set cmd = ($cmd --refnl $intertrg)
+      set cmd = ($cmd --reg   $xfmdir/syn2anatorig.$reg.lta)
+    else if ($xspace == fnt) then
+      set cmd = ($cmd --regnl $xfmdir/diff2fsl_warp.m3z)
+      set cmd = ($cmd --refnl $dwidir/dtifit_FA.nii.gz)
+      set cmd = ($cmd --reg   $xfmdir/diff2anatorig.$reg.lta)
+    endif
+    set cmd = ($cmd --basereg $basereglist)
+    set cmd = ($cmd --baseref $labdir/anatorig/${segname}_mask.nii.gz)
+    set cmd = ($cmd --ncpts   $ncpts)
+    if ($reinit)      set cmd = ($cmd --xstr)
+    if ($usetrunc)    set cmd = ($cmd --trunc)
+    if ($dosegprior)  set cmd = ($cmd --aprior)
+    if ($dotangprior) set cmd = ($cmd --sprior)
+    if ($debug)       set cmd = ($cmd --debug)
+    echo $cmd |& tee -a $LF |& tee -a $CF
+    if ($RunIt) then
+      $fs_time $cmd |& tee -a $LF
+      if ($status) goto error_exit
+    endif
+  end
+endif
+
+# Remove the error file
+if ($DoIsRunning && $#IsRunningFile) rm -f $IsRunningFile
+
+# Create the done file
+echo "------------------------------" > $DoneFile
+echo "SUBJECT $subj" >> $DoneFile
+echo "DATE `date`"     >> $DoneFile
+echo "USER `whoami`"      >> $DoneFile
+echo "HOST `hostname`" >> $DoneFile
+echo "PROCESSOR `uname -m`" >> $DoneFile
+echo "OS `uname -s`"       >> $DoneFile
+uname -a         >> $DoneFile
+echo $VERSION    >> $DoneFile
+echo $0          >> $DoneFile
+
+echo "#-------------------------------------" |& tee -a $LF
+echo "$ProgName finished without error at `date`" |& tee -a $LF
+
+exit 0
+#############------------------------------------#######################
+##################>>>>>>>>>>>>>.<<<<<<<<<<<<<<<<<#######################
+#############------------------------------------#######################
+
+############--------------##################
+error_exit:
+  uname -a | tee -a $LF
+  echo "" |& tee -a $LF
+  echo "$ProgName exited with ERRORS at `date`" |& tee -a $LF
+  echo "" |& tee -a $LF
+
+  # Remove IsRunningFile
+  if($DoIsRunning && $#IsRunningFile) rm -f $IsRunningFile
+
+  # Create an error file with date, cmd, etc of error
+  if ($?ErrorFile) then
+    echo "------------------------------" > $ErrorFile
+    echo "SUBJECT $subj" >> $ErrorFile
+    echo "DATE `date`"     >> $ErrorFile
+    echo "USER `whoami`"      >> $ErrorFile
+    echo "HOST `hostname`" >> $ErrorFile
+    echo "PROCESSOR `uname -m`" >> $ErrorFile
+    echo "OS `uname -s`"       >> $ErrorFile
+    uname -a         >> $ErrorFile
+    echo $VERSION    >> $ErrorFile
+    echo $0          >> $ErrorFile
+    echo "PWD `pwd`" >> $ErrorFile
+    echo "CMD $cmd"  >> $ErrorFile
+  endif
+
+  # Finally exit
+  exit 1
+
+############--------------##################
+parse_args:
+set cmdline = ($argv)
+
+while( $#argv != 0 )
+  set flag = $argv[1]; shift;
+
+  if ("$flag" == ";") break;
+
+  switch($flag)
+    case "-c":
+      if ( $#argv < 1) goto arg1err;
+      set rcfile = "$argv[1]"; shift;
+      if (! -e "$rcfile") then
+        echo "ERROR: cannot find $rcfile"
+        goto error_exit
+      endif
+      if (! -r "$rcfile") then
+        echo "ERROR: $rcfile exists but is not readable"
+        goto error_exit
+      endif
+      breaksw
+
+    case "-time":
+      set DoTime = 1
+      breaksw
+
+    case "-notime":
+      set DoTime = 0
+      breaksw
+
+    case "-log":
+      if ( $#argv < 1) goto arg1err;
+      set LF = $argv[1]; shift;
+      breaksw
+
+    case "-nolog":
+      set LF = /dev/null
+      breaksw
+
+    case "-cmd":
+      if ( $#argv < 1) goto arg1err;
+      set CF = $argv[1]; shift;
+      breaksw
+
+    case "-nocmd":
+      set CF = /dev/null
+      breaksw
+
+    case "-no-isrunning":
+      set DoIsRunning = 0
+      breaksw
+
+    case "-umask":
+      if ( $#argv < 1) goto arg1err;
+      umask $1; shift;
+      breaksw
+
+    case "-grp":
+      if ( $#argv < 1) goto arg1err;
+      set grp = $argv[1];
+      set curgrp = `id -gn`;
+      if($grp != $curgrp) then
+        echo "ERROR: current group $curgrp and specified group $grp differ"
+        goto error_exit;
+      endif
+      breaksw
+
+    case "-allowcoredump":
+      limit coredumpsize unlimited
+      breaksw
+
+    case "-debug":
+      set debug = 1
+      breaksw
+
+    case "-dontrun":
+      set RunIt = 0
+      breaksw
+
+    case "-onlyversions":
+      set DoVersionsOnly = 1
+      breaksw
+
+    default:
+      echo "ERROR: flag $flag unrecognized"
+      echo $cmdline
+      goto error_exit
+      breaksw
+  endsw
+end
+
+goto parse_args_return;
+
+############--------------##################
+arg1err:
+  echo "ERROR: flag $flag requires one argument"
+  goto error_exit
+
+############--------------##################
+check_params:
+  if (! $#rcfile) then
+    echo "ERROR: a configuration (dmrirc) file must be specified"
+    goto error_exit
+  endif
+
+  if (! $#LF) set LF = `dirname $rcfile`/trac-all.log
+  if (! $#CF) set CF = `dirname $rcfile`/trac-all.cmd
+
+goto check_params_return;
+
+############--------------##################
+usage_exit:
+  echo ""
+  echo "USAGE: $ProgName"
+  echo ""
+  echo "Required arguments:"
+  echo "  -c <file>      : dmrirc file (see dmrirc.example)"
+  echo ""
+  echo "Other arguments:"
+  echo "  -log <file>    : default is trac-all.log in the same dir as dmrirc"
+  echo "  -nolog         : do not save a log file"
+  echo "  -cmd <file>    : default is trac-all.cmd in the same dir as dmrirc"
+  echo "  -nocmd         : do not save a cmd file"
+  echo "  -no-isrunning  : do not check whether this subject is currently being processed"
+  echo "  -umask umask   : set unix file permission mask (default 002)"
+  echo "  -grp groupid   : check that current group is alpha groupid "
+  echo "  -allowcoredump : set coredump limit to unlimited"
+  echo "  -debug         : generate much more output"
+  echo "  -dontrun       : do everything but execute each command"
+  echo "  -version       : print version of this script and exit"
+  echo "  -help          : print full contents of help"
+  echo ""
+
+  if(! $PrintHelp) exit 1
+
+  echo $VERSION
+  echo ""
+
+  cat $0 | awk 'BEGIN{prt=0}{if(prt) print $0;if($1 == "BEGINHELP") prt=1}'
+
+  exit 1
+
+#---- Everything below here is printed out as part of help -----#
+BEGINHELP
+
+Tractography pre-processing for a single subject.
+
+This script is called by trac-all. Trac-all makes sure that a proper
+configuration file is written locally (scripts/dmrirc.local) and passed
+as an argument to this script.
+
+SEE ALSO: trac-all, dmrirc.example
+
