@@ -1,5 +1,8 @@
 # Meisler_ReadingInt_DWI
 Code and data used in the Meisler, Gabrieli, and Christodoulou 2024 paper on DWI correlates of reading intervention.
+To cite:
+Meisler, Steven L., John DE Gabrieli, and Joanna A. Christodoulou. "White matter microstructural plasticity associated with educational intervention in reading disability." _Imaging Neuroscience_ (2024).
+[![DOI](https://zenodo.org/badge/doi/10.1162/imag_a_00108.svg)](https://doi.org/10.1162/imag_a_00108)
 
 If using code in this study, please note the following:
 - You need a FreeSurfer license (register here: https://surfer.nmr.mgh.harvard.edu/registration.html)
